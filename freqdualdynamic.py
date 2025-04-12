@@ -1,14 +1,12 @@
 # -*- coding: utf-8 -*-
 # @Time    : 2025/4/10
 # @Author  : OuyangNingtai
-# @Email   : ouyangingtai@example.com
+
 
 r"""
 FreqDualDynamic
 ################################################
-Reference:
-    OuyangNingtai et al. "Frequency Domain Dual-Channel Dynamic Recommendation for Reducing Repetition."
-    In RecSys 2025.
+
 """
 
 import numpy as np
