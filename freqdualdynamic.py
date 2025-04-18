@@ -1,12 +1,13 @@
 # -*- coding: utf-8 -*-
 # @Time    : 2025/4/10
-# @Author  : OuyangNingtai
 
 
 r"""
 FreqDualDynamic
 ################################################
-
+Reference:
+    OuyangNingtai et al. "Frequency Domain Dual-Channel Dynamic Recommendation for Reducing Repetition."
+    In RecSys 2025.
 """
 
 import numpy as np
@@ -35,13 +36,23 @@ class FrequencyDomainDecoupler(nn.Module):
         # 特征提取器
         self.encoder = nn.Sequential(
             nn.Linear(embedding_dim, embedding_dim*2),
+            nn.LayerNorm(embedding_dim*2),  
             nn.ReLU(),
+            nn.Dropout(0.2), 
             nn.Linear(embedding_dim*2, embedding_dim)
         )
         
         # 频域投影层
-        self.high_freq_projector = nn.Linear(embedding_dim, embedding_dim)
-        self.low_freq_projector = nn.Linear(embedding_dim, embedding_dim)
+        self.high_freq_projector = nn.Sequential(
+            nn.Linear(embedding_dim, embedding_dim),
+            nn.LayerNorm(embedding_dim),
+            nn.ReLU()
+        )
+        self.low_freq_projector = nn.Sequential(
+            nn.Linear(embedding_dim, embedding_dim),
+            nn.LayerNorm(embedding_dim),
+            nn.ReLU()
+        )
         
     def forward(self, seq_output):
         """
@@ -145,6 +156,7 @@ class FrequencyEvolutionTracker(nn.Module):
         freq_magnitude = torch.abs(freq_history)
         
         # GRU处理序列
+        self.change_detector.flatten_parameters()
         lstm_out, _ = self.change_detector(freq_magnitude)
         
         # 提取最后时间步特征
@@ -219,11 +231,17 @@ class DynamicFrequencyFusion(nn.Module):
         
         # 融合网络
         self.fusion_network = nn.Sequential(
-            nn.Linear(embedding_dim * 2 + 1, 128),  # +1 for fatigue score
+            nn.Linear(embedding_dim * 2 + 1, embedding_dim),
+            nn.LayerNorm(embedding_dim),
             nn.ReLU(),
-            nn.Linear(128, 1),
-            nn.Sigmoid()  # 输出融合比例
+            nn.Dropout(0.1),
+            nn.Linear(embedding_dim, 64),
+            nn.ReLU(),
+            nn.Linear(64, 1),
+            nn.Sigmoid()
         )
+        self.residual_projection = nn.Linear(embedding_dim * 2, embedding_dim)
+    
         
     def forward(self, high_freq_repr, low_freq_repr, fatigue_scores):
         """
@@ -247,9 +265,13 @@ class DynamicFrequencyFusion(nn.Module):
         # 计算动态权重 (高频权重)
         high_freq_weight = self.fusion_network(fusion_input)
         low_freq_weight = 1 - high_freq_weight
+
+        weighted_repr = high_freq_weight * high_freq_repr + low_freq_weight * low_freq_repr
+        combined_repr = torch.cat([high_freq_repr, low_freq_repr], dim=1)
+        residual_repr = self.residual_projection(combined_repr)
         
         # 融合表示
-        fused_repr = high_freq_weight * high_freq_repr + low_freq_weight * low_freq_repr
+        fused_repr = weighted_repr + residual_repr
         
         return fused_repr, high_freq_weight, low_freq_weight
 
@@ -294,8 +316,7 @@ class FreqDualDynamic(SequentialRecommender):
             self.max_seq_length, self.embedding_size
         )
         
-        # 初始化序列编码器 (使用FEARec现有的编码器)
-        # 这里假设已经存在FEAEncoder
+
         try:
             from recbole.model.sequential_recommender.fearec import FEAEncoder
             self.encoder = FEAEncoder(
@@ -311,6 +332,7 @@ class FreqDualDynamic(SequentialRecommender):
             )
         except ImportError:
             # 如果没有FEARec，使用标准Transformer编码器
+            
             from recbole.model.layers import TransformerEncoder
             self.encoder = TransformerEncoder(
                 n_layers=self.n_layers,
@@ -342,7 +364,9 @@ class FreqDualDynamic(SequentialRecommender):
         # 层归一化与dropout
         self.LayerNorm = nn.LayerNorm(self.embedding_size, eps=self.layer_norm_eps)
         self.dropout = nn.Dropout(self.hidden_dropout_prob)
+
         
+        self.loss_type = config['loss_type']
         # 损失函数
         if config['loss_type'] == 'BPR':
             self.loss_fct = BPRLoss()
@@ -420,7 +444,11 @@ class FreqDualDynamic(SequentialRecommender):
             seq_output = encoder_outputs[-1]
         else:
             # 标准Transformer编码器直接返回最后层输出
-            seq_output = self.encoder(input_emb, extended_attention_mask)
+            encoder_output = self.encoder(input_emb, extended_attention_mask)
+            if isinstance(encoder_output, list):
+                seq_output = encoder_output[-1]
+            else:
+                 seq_output = encoder_output
         
         output = self.gather_indexes(seq_output, item_seq_len - 1)
         
@@ -430,19 +458,18 @@ class FreqDualDynamic(SequentialRecommender):
         # 更新频谱历史
         if self.freq_history is None or self.freq_history.shape[0] != freq_domain.shape[0]:
             # 首次运行或批次大小变化时初始化
-            self.freq_history = freq_domain.unsqueeze(1).detach()
+            self.freq_history = freq_domain.detach()
         else:
-            # 维度压缩: [B, 1, F] -> [B, F]
-            compressed_freq = freq_domain.squeeze(1).detach()
-            if len(self.freq_history.shape) == 3:
-                # 历史已存在，添加新的
-                self.freq_history = torch.cat([self.freq_history, compressed_freq.unsqueeze(1)], dim=1)
-                # 保持历史长度限制
-                if self.freq_history.shape[1] > self.freq_history_length:
-                    self.freq_history = self.freq_history[:, 1:]
-            else:
-                # 历史维度不匹配，重新初始化
-                self.freq_history = compressed_freq.unsqueeze(1).detach()
+            if len(freq_domain.shape) != len(self.freq_history.shape):
+                if len(freq_domain.shape) > len(self.freq_history.shape):
+                    while len(freq_domain.shape) > len(self.freq_history.shape):
+                        freq_domain = freq_domain.squeeze(1)
+                else:
+                    while len(freq_domain.shape) < len(self.freq_history.shape):
+                        freq_domain = freq_domain.unsqueeze(1)
+            self.freq_history = torch.cat([self.freq_history, freq_domain.detach()], dim=1)
+            if self.freq_history.shape[1] > self.freq_history_length:
+                self.freq_history = self.freq_history[:, 1:]
         
         # 跟踪兴趣演化
         fatigue_scores, _ = self.evolution_tracker(self.freq_history)
@@ -576,5 +603,7 @@ class FreqDualDynamic(SequentialRecommender):
         seq_output = self.forward(item_seq, item_seq_len)
         test_items_emb = self.item_embedding.weight
         scores = torch.matmul(seq_output, test_items_emb.transpose(0, 1))
+        
+        return scores
         
         return scores
