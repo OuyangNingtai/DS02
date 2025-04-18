@@ -606,4 +606,4 @@ class FreqDualDynamic(SequentialRecommender):
         
         return scores
         
-        return scores
+
