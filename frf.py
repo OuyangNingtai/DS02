@@ -15,10 +15,497 @@ import torch.nn as nn
 import torch.nn.functional as F
 import math
 import time
+import logging
+import os
+from tqdm import tqdm
+from collections import defaultdict
+from scipy.sparse import csr_matrix
 
 from recbole.model.abstract_recommender import SequentialRecommender
 from recbole.model.loss import BPRLoss
 from recbole.data.interaction import Interaction
+from recbole.data.dataset import Dataset
+from recbole.utils import set_color
+
+
+class DTWCoreSetProcessor:
+    """基于DTW的核心集处理器
+    
+    对序列数据进行DTW核心集构建，减少数据规模并保持表达能力。
+    
+    Args:
+        dataset (Dataset): 数据集对象
+        embedding_size (int): 嵌入维度
+        sample_ratio (float): 采样比例，默认0.3
+        sensitivity_alpha (float): 敏感性计算中的α参数，默认2.0
+        sensitivity_beta (float): 敏感性计算中的β参数，默认4.0
+        dtw_epsilon (float): DTW路径度量近似参数，默认0.1
+        use_metric_closure (bool): 是否使用路径度量，默认True
+        cache_dir (str): 缓存目录，默认'./dtw_coreset_cache'
+        force_recompute (bool): 是否强制重新计算，默认False
+        dataset_name (str): 数据集名称，用于缓存文件命名
+    """
+    def __init__(self, dataset, embedding_size, sample_ratio=0.3, 
+                 sensitivity_alpha=2.0, sensitivity_beta=4.0, dtw_epsilon=0.1,
+                 use_metric_closure=True, cache_dir='./dtw_coreset_cache', 
+                 force_recompute=False, dataset_name=None):
+        self.logger = logging.getLogger()
+        self.dataset = dataset
+        self.embedding_size = embedding_size
+        self.sample_ratio = sample_ratio
+        self.sensitivity_alpha = sensitivity_alpha
+        self.sensitivity_beta = sensitivity_beta
+        self.dtw_epsilon = dtw_epsilon
+        self.use_metric_closure = use_metric_closure
+        self.cache_dir = cache_dir
+        self.force_recompute = force_recompute
+        self.dataset_name = dataset_name or 'default_dataset'
+        
+        # 创建缓存目录
+        if not os.path.exists(cache_dir):
+            os.makedirs(cache_dir)
+            
+        # DTW距离计算缓存
+        self.dtw_cache = {}
+        self.max_cache_size = 10000
+        
+        # 数据集信息
+        self.uid_field = dataset.uid_field
+        self.iid_field = dataset.iid_field
+        self.time_field = dataset.time_field if hasattr(dataset, 'time_field') else None
+        self.item_num = dataset.item_num
+        
+        # 初始化嵌入
+        self.item_embeddings = None
+        
+    def _init_item_embeddings(self):
+        """初始化物品嵌入
+        
+        使用Xavier初始化生成随机嵌入或从预训练模型加载
+        """
+        self.logger.info("初始化物品嵌入用于DTW核心集计算...")
+        
+        # 检查是否存在预训练嵌入
+        pretrained_path = os.path.join(self.cache_dir, f"{self.dataset_name}_pretrained_emb.npy")
+        if os.path.exists(pretrained_path) and not self.force_recompute:
+            self.logger.info(f"加载预训练物品嵌入: {pretrained_path}")
+            self.item_embeddings = torch.tensor(np.load(pretrained_path), dtype=torch.float32)
+        else:
+            # 随机初始化
+            self.logger.info("使用Xavier初始化物品嵌入")
+            self.item_embeddings = torch.zeros((self.item_num + 1, self.embedding_size))
+            nn.init.xavier_normal_(self.item_embeddings)
+    
+    def dtw_distance(self, seq1, seq2, p=2):
+        """计算两个序列间的DTW距离
+        
+        Args:
+            seq1 (torch.Tensor): 第一个序列
+            seq2 (torch.Tensor): 第二个序列
+            p (int): 距离范数，默认为2（欧氏距离）
+            
+        Returns:
+            float: DTW距离值
+        """
+        # 将序列转为numpy进行缓存
+        try:
+            seq1_bytes = seq1.cpu().numpy().tobytes()
+            seq2_bytes = seq2.cpu().numpy().tobytes()
+            cache_key = (hash(seq1_bytes), hash(seq2_bytes))
+            
+            if cache_key in self.dtw_cache:
+                return self.dtw_cache[cache_key]
+        except:
+            cache_key = None
+        
+        # 序列长度
+        n, m = len(seq1), len(seq2)
+        
+        # 对于非常短的序列，简化为欧式距离
+        if n <= 2 or m <= 2:
+            if n == m:
+                dist = np.linalg.norm(seq1 - seq2) / max(n, 1)
+            else:
+                # 简单的均值比较
+                dist = np.linalg.norm(np.mean(seq1, axis=0) - np.mean(seq2, axis=0))
+            
+            if cache_key is not None:
+                self.dtw_cache[cache_key] = dist
+            return dist
+        
+        # 创建DTW矩阵
+        dtw_matrix = np.zeros((n+1, m+1)) + np.inf
+        dtw_matrix[0, 0] = 0
+        
+        # 计算成对距离
+        for i in range(1, n+1):
+            for j in range(1, m+1):
+                cost = np.linalg.norm(seq1[i-1] - seq2[j-1], ord=p)
+                dtw_matrix[i, j] = cost + min(
+                    dtw_matrix[i-1, j],    # 插入
+                    dtw_matrix[i, j-1],    # 删除
+                    dtw_matrix[i-1, j-1]   # 替换
+                )
+        
+        dist = dtw_matrix[n, m]
+        
+        # 存入缓存
+        if cache_key is not None:
+            if len(self.dtw_cache) >= self.max_cache_size:
+                # 清理部分缓存
+                keys_to_remove = list(self.dtw_cache.keys())[:self.max_cache_size//2]
+                for k in keys_to_remove:
+                    self.dtw_cache.pop(k, None)
+            
+            self.dtw_cache[cache_key] = dist
+            
+        return dist
+    
+    def compute_path_metric(self, seq1, seq2, intermediates):
+        """计算路径度量（满足三角不等式的DTW变种）
+        
+        Args:
+            seq1 (np.ndarray): 第一个序列
+            seq2 (np.ndarray): 第二个序列
+            intermediates (list): 中间点序列
+            
+        Returns:
+            float: 路径度量距离
+        """
+        if not intermediates:
+            return self.dtw_distance(seq1, seq2)
+        
+        # 通过中间点计算路径
+        path_dist = self.dtw_distance(seq1, intermediates[0])
+        
+        for i in range(len(intermediates) - 1):
+            path_dist += self.dtw_distance(intermediates[i], intermediates[i+1])
+            
+        path_dist += self.dtw_distance(intermediates[-1], seq2)
+        
+        return path_dist
+    
+    def _get_initial_centers(self, sequences, num_centers=5):
+        """初始化聚类中心
+        
+        使用k-means++思想选择初始聚类中心
+        
+        Args:
+            sequences (list): 序列列表
+            num_centers (int): 中心数量
+            
+        Returns:
+            list: 初始聚类中心索引
+        """
+        self.logger.info(f"使用k-means++策略选择{num_centers}个初始聚类中心...")
+        n_samples = len(sequences)
+        
+        # 随机选择第一个中心
+        center_indices = [np.random.randint(0, n_samples)]
+        centers = [sequences[center_indices[0]]]
+        
+        # 选择剩余的中心
+        for _ in range(1, num_centers):
+            # 计算每个点到最近中心的距离
+            min_distances = np.array([
+                min([self.dtw_distance(seq, center) for center in centers])
+                for seq in sequences
+            ])
+            
+            # 按距离加权随机选择下一个中心
+            weights = min_distances / min_distances.sum()
+            next_center_idx = np.random.choice(n_samples, p=weights)
+            
+            center_indices.append(next_center_idx)
+            centers.append(sequences[next_center_idx])
+        
+        return center_indices
+    
+    def _compute_sensitivities(self, sequences, initial_centers_idx):
+        """计算每个序列的敏感性
+        
+        Args:
+            sequences (list): 序列列表
+            initial_centers_idx (list): 初始中心索引
+            
+        Returns:
+            np.ndarray: 敏感性数组
+        """
+        self.logger.info("计算序列敏感性...")
+        n_samples = len(sequences)
+        sensitivities = np.zeros(n_samples)
+        
+        # 获取初始聚类中心
+        centers = [sequences[idx] for idx in initial_centers_idx]
+        
+        # 计算Voronoi分区
+        assignments = np.zeros(n_samples, dtype=int)
+        for i, seq in enumerate(sequences):
+            min_dist = float('inf')
+            min_idx = 0
+            
+            for c_idx, center in enumerate(centers):
+                dist = self.dtw_distance(seq, center)
+                if dist < min_dist:
+                    min_dist = dist
+                    min_idx = c_idx
+            
+            assignments[i] = min_idx
+        
+        # 计算总聚类成本和每个分区的成本
+        total_cost = 0
+        partition_costs = np.zeros(len(centers))
+        partition_sizes = np.zeros(len(centers))
+        
+        for i, seq in enumerate(sequences):
+            center_idx = assignments[i]
+            dist = self.dtw_distance(seq, centers[center_idx])
+            total_cost += dist
+            partition_costs[center_idx] += dist
+            partition_sizes[center_idx] += 1
+        
+        # 使用估计公式计算敏感性上界
+        for i, seq in enumerate(sequences):
+            center_idx = assignments[i]
+            seq_dist = self.dtw_distance(seq, centers[center_idx])
+            
+            # 防止除零
+            v_size = max(1, partition_sizes[center_idx])
+            
+            # 敏感性上界公式
+            term1 = (2 * self.sensitivity_alpha * seq_dist) / total_cost
+            term2 = 4 / v_size
+            term3 = (8 * self.sensitivity_alpha * partition_costs[center_idx]) / (total_cost * v_size)
+            
+            # 计算敏感性
+            seq_len = len(seq)
+            d = seq[0].shape[0] if len(seq) > 0 else self.embedding_size
+            sensitivity = (seq_len * d)**(1/2) * (term1 + term2 + term3)
+            
+            # 确保敏感性为正值且不为零
+            sensitivities[i] = max(0.01, sensitivity)
+        
+        return sensitivities
+    
+    def _simplify_sequences(self, sequences, max_len=None):
+        """简化序列，减少复杂度
+        
+        Args:
+            sequences (list): 序列列表
+            max_len (int, optional): 最大长度
+            
+        Returns:
+            list: 简化后的序列
+        """
+        self.logger.info("简化序列复杂度...")
+        
+        if max_len is None:
+            # 确定合适的最大长度
+            lengths = [len(seq) for seq in sequences]
+            max_len = min(50, np.percentile(lengths, 90))
+        
+        simplified = []
+        for seq in sequences:
+            if len(seq) <= max_len:
+                simplified.append(seq)
+            else:
+                # 等间隔采样
+                indices = np.linspace(0, len(seq)-1, max_len, dtype=int)
+                simplified.append(seq[indices])
+        
+        return simplified
+    
+    def _sample_coreset(self, sequences, sensitivities, coreset_size):
+        """基于敏感性采样构建核心集
+        
+        Args:
+            sequences (list): 序列列表
+            sensitivities (np.ndarray): 敏感性数组
+            coreset_size (int): 核心集大小
+            
+        Returns:
+            tuple: 核心集序列，核心集权重，核心集用户ID
+        """
+        self.logger.info(f"基于敏感性采样构建大小为{coreset_size}的核心集...")
+        n_samples = len(sequences)
+        
+        # 计算采样概率
+        total_sensitivity = np.sum(sensitivities)
+        probs = sensitivities / total_sensitivity
+        
+        # 有放回采样
+        sampled_indices = np.random.choice(
+            n_samples, size=coreset_size, replace=True, p=probs
+        )
+        
+        # 计算权重
+        unique_indices, counts = np.unique(sampled_indices, return_counts=True)
+        weights = {}
+        
+        for idx, count in zip(unique_indices, counts):
+            weights[idx] = (count / coreset_size) * (total_sensitivity / sensitivities[idx])
+        
+        # 获取核心集序列和对应权重
+        coreset_sequences = [sequences[idx] for idx in unique_indices]
+        coreset_weights = np.array([weights[idx] for idx in unique_indices])
+        coreset_uids = [self.uid_list[idx] for idx in unique_indices]
+        
+        return coreset_sequences, coreset_weights, coreset_uids
+    
+    def _extract_user_sequences(self):
+        """从数据集中提取用户交互序列
+        
+        Returns:
+            tuple: 用户序列列表，用户ID列表
+        """
+        self.logger.info("从数据集提取用户交互序列...")
+        
+        # 获取交互数据
+        inter_feat = self.dataset.inter_feat
+        user_ids = inter_feat[self.uid_field].numpy()
+        item_ids = inter_feat[self.iid_field].numpy()
+        
+        # 时间信息（如果有）
+        if self.time_field is not None and self.time_field in inter_feat:
+            times = inter_feat[self.time_field].numpy()
+            # 按用户ID和时间排序
+            sort_idx = np.lexsort((times, user_ids))
+        else:
+            # 仅按用户ID排序
+            sort_idx = np.argsort(user_ids)
+        
+        user_ids = user_ids[sort_idx]
+        item_ids = item_ids[sort_idx]
+        
+        # 分组构建序列
+        user_sequences = defaultdict(list)
+        for user_id, item_id in zip(user_ids, item_ids):
+            user_sequences[user_id].append(item_id)
+        
+        # 转换为嵌入序列
+        sequences = []
+        uid_list = []
+        
+        for user_id, items in user_sequences.items():
+            # 转换物品ID为嵌入
+            seq_emb = [self.item_embeddings[item_id].numpy() for item_id in items]
+            if len(seq_emb) > 1:  # 忽略长度为1的序列
+                sequences.append(np.array(seq_emb))
+                uid_list.append(user_id)
+        
+        self.logger.info(f"提取了{len(sequences)}个用户序列")
+        return sequences, uid_list
+    
+    def _save_coreset_data(self, coreset_uids, coreset_weights):
+        """保存核心集数据
+        
+        Args:
+            coreset_uids (list): 核心集用户ID
+            coreset_weights (np.ndarray): 核心集权重
+        """
+        cache_path = os.path.join(self.cache_dir, f"{self.dataset_name}_coreset_info.npz")
+        np.savez(
+            cache_path,
+            uids=np.array(coreset_uids),
+            weights=coreset_weights
+        )
+        self.logger.info(f"核心集数据已保存至: {cache_path}")
+    
+    def build_coreset(self):
+        """构建DTW核心集
+        
+        返回:
+            tuple: 核心集用户ID, 核心集权重
+        """
+        # 检查缓存
+        cache_path = os.path.join(self.cache_dir, f"{self.dataset_name}_coreset_info.npz")
+        if os.path.exists(cache_path) and not self.force_recompute:
+            self.logger.info(f"加载缓存的核心集数据: {cache_path}")
+            data = np.load(cache_path)
+            return data['uids'].tolist(), data['weights']
+        
+        # 初始化物品嵌入
+        self._init_item_embeddings()
+        
+        # 提取用户序列
+        sequences, self.uid_list = self._extract_user_sequences()
+        
+        # 简化序列
+        sequences = self._simplify_sequences(sequences)
+        
+        # 确定核心集大小
+        total_users = len(sequences)
+        coreset_size = max(int(total_users * self.sample_ratio), 100)
+        self.logger.info(f"目标核心集大小: {coreset_size} (原始用户数: {total_users})")
+        
+        # 初始聚类中心
+        k = min(10, max(5, int(np.sqrt(coreset_size))))
+        initial_centers = self._get_initial_centers(sequences, num_centers=k)
+        
+        # 计算敏感性
+        sensitivities = self._compute_sensitivities(sequences, initial_centers)
+        
+        # 采样构建核心集
+        _, coreset_weights, coreset_uids = self._sample_coreset(
+            sequences, sensitivities, coreset_size
+        )
+        
+        # 保存核心集信息
+        self._save_coreset_data(coreset_uids, coreset_weights)
+        
+        return coreset_uids, coreset_weights
+    
+    def process_dataset(self):
+        """处理数据集，构建核心集并应用到数据集
+        
+        Returns:
+            Dataset: 处理后的数据集
+        """
+        self.logger.info(set_color("开始DTW核心集处理...", "green"))
+        
+        # 构建核心集
+        coreset_uids, coreset_weights = self.build_coreset()
+        
+        # 创建核心集用户ID到权重的映射
+        uid_to_weight = {uid: weight for uid, weight in zip(coreset_uids, coreset_weights)}
+        
+        # 应用到数据集
+        self.logger.info("基于核心集处理数据集...")
+        inter_feat = self.dataset.inter_feat
+        uid_field = self.dataset.uid_field
+        
+        # 获取交互数据中的用户ID
+        user_ids = inter_feat[uid_field].numpy()
+        
+        # 创建用户ID到权重的映射数组
+        weights = np.ones(len(user_ids))
+        for i, uid in enumerate(user_ids):
+            if uid in uid_to_weight:
+                weights[i] = uid_to_weight[uid]
+            else:
+                weights[i] = 0.1  # 非核心集用户给予小权重
+        
+        # 将权重添加到数据集
+        weight_field = 'dtw_coreset_weight'
+        inter_feat.update(weight_field, torch.FloatTensor(weights))
+        
+        # 创建核心集掩码
+        coreset_mask = np.zeros(len(user_ids), dtype=bool)
+        for i, uid in enumerate(user_ids):
+            if uid in uid_to_weight:
+                coreset_mask[i] = True
+        
+        # 将核心集掩码添加到数据集
+        mask_field = 'dtw_coreset_mask'
+        inter_feat.update(mask_field, torch.BoolTensor(coreset_mask))
+        
+        self.logger.info(f"数据集处理完成！添加了字段 '{weight_field}' 和 '{mask_field}'")
+        
+        # 统计信息
+        n_coreset = np.sum(coreset_mask)
+        self.logger.info(set_color(f"核心集大小: {len(coreset_uids)}, 核心集交互数: {n_coreset}", "green"))
+        
+        return self.dataset
 
 
 class DTWFrequencyDomainDecoupler(nn.Module):
@@ -73,10 +560,10 @@ class DTWFrequencyDomainDecoupler(nn.Module):
             seq_output (torch.Tensor): 序列特征
             
         Returns:
-            float: 自适应截断比例 [0.5, 1]
+            float: 自适应截断比例 [0.3, 0.9】
         """
-        cutoff_base = 0.5
-        cutoff_range = 0.5  # 最高到1
+        cutoff_base = 0.3
+        cutoff_range = 0.55  # 最高到0.95
         cutoff = cutoff_base + cutoff_range * self.adaptive_cutoff_net(seq_output).mean()
         return cutoff.item()
         
@@ -349,7 +836,7 @@ class DTWRepetitiveInterestTracker(nn.Module):
         else:
             scale_features.append(self.scale_projections[1](scale1))
         
-        # 尺度3: 长期 (如果有)
+        # 尺度3: 最早 (如果有)
         if high_freq_magnitude.shape[1] >= 2:
             scale3 = high_freq_magnitude[:, 0, :]
             scale_features.append(self.scale_projections[2](scale3))
@@ -594,6 +1081,15 @@ class FRF(SequentialRecommender):
     def __init__(self, config, dataset):
         super(FRF, self).__init__(config, dataset)
         
+        # 获取logger
+        self.logger = logging.getLogger()
+        
+        # 获取数据集名称
+        if hasattr(dataset, 'dataset_name'):
+            self.dataset_name = dataset.dataset_name
+        else:
+            self.dataset_name = config['dataset']
+        
         # 加载参数信息
         self.embedding_size = config['embedding_size']  # 嵌入维度
         self.hidden_size = config['hidden_size']  # 隐层维度
@@ -622,6 +1118,18 @@ class FRF(SequentialRecommender):
         self.use_dtw_probe = config['use_dtw_probe'] if 'use_dtw_probe' in config else False  # 是否使用DTW兴趣探针
         self.dtw_update_freq = config['dtw_update_freq'] if 'dtw_update_freq' in config else 5  # DTW更新频率
         
+        # 核心集处理相关参数
+        self.use_dtw_coreset = config['use_dtw_coreset'] if 'use_dtw_coreset' in config else True  # 是否使用DTW核心集
+        self.dtw_coreset_ratio = config['dtw_coreset_ratio'] if 'dtw_coreset_ratio' in config else 0.3  # 核心集采样比例
+        self.dtw_coreset_cache = config['dtw_coreset_cache'] if 'dtw_coreset_cache' in config else './dtw_coreset_cache'  # 核心集缓存目录
+        self.dtw_force_recompute = config['dtw_force_recompute'] if 'dtw_force_recompute' in config else False  # 强制重新计算核心集
+        
+        # 检查并处理DTW核心集
+        self.has_coreset_weight = False
+        if self.use_dtw_coreset:
+            self.logger.info(set_color("开始DTW核心集处理...", "green"))
+            self.process_dtw_coreset()
+        
         # 初始化嵌入层
         self.item_embedding = nn.Embedding(
             self.n_items, self.embedding_size, padding_idx=0
@@ -645,7 +1153,7 @@ class FRF(SequentialRecommender):
                 layer_norm_eps=self.layer_norm_eps
             )
         except ImportError as e:
-            print(f"导入Transformer编码器失败: {e}")
+            self.logger.warning(f"导入Transformer编码器失败: {e}")
             # 简单的RNN编码器作为降级方案
             self.encoder = nn.LSTM(
                 input_size=self.embedding_size,
@@ -701,6 +1209,35 @@ class FRF(SequentialRecommender):
         
         # 性能追踪
         self.time_stats = {'forward': [], 'dtw': [], 'fft': []}
+    
+    def process_dtw_coreset(self):
+        """处理数据集，应用DTW核心集
+        """
+        try:
+            # 创建DTW核心集处理器
+            coreset_processor = DTWCoreSetProcessor(
+                dataset=self.dataset,
+                embedding_size=self.embedding_size,
+                sample_ratio=self.dtw_coreset_ratio,
+                cache_dir=self.dtw_coreset_cache,
+                force_recompute=self.dtw_force_recompute,
+                dataset_name=self.dataset_name
+            )
+            
+            # 处理数据集
+            self.dataset = coreset_processor.process_dataset()
+            
+            # 检查权重字段是否已添加到数据集
+            if 'dtw_coreset_weight' in self.dataset.inter_feat:
+                self.logger.info(set_color("成功添加DTW核心集权重到数据集", "green"))
+                self.has_coreset_weight = True
+            else:
+                self.logger.warning("未能添加DTW核心集权重到数据集")
+                self.has_coreset_weight = False
+                
+        except Exception as e:
+            self.logger.error(f"DTW核心集处理失败: {e}")
+            self.has_coreset_weight = False
     
     def _init_weights(self, module):
         """初始化权重"""
@@ -790,7 +1327,7 @@ class FRF(SequentialRecommender):
                     seq_output = encoder_output
             except Exception as e:
                 # 出错时回退到简单平均
-                print(f"编码器出错: {e}, 使用简单平均")
+                self.logger.warning(f"编码器出错: {e}, 使用简单平均")
                 seq_output = input_emb.mean(dim=1, keepdim=True).expand(-1, input_emb.size(1), -1)
     
         output = self.gather_indexes(seq_output, item_seq_len - 1)
@@ -897,6 +1434,14 @@ class FRF(SequentialRecommender):
         item_seq_len = interaction[self.ITEM_SEQ_LEN]
         pos_items = interaction[self.POS_ITEM_ID]
         
+        # 获取样本权重（如果存在核心集权重）
+        if self.has_coreset_weight and 'dtw_coreset_weight' in interaction:
+            sample_weights = interaction['dtw_coreset_weight'].float()
+            # 标准化权重，确保平均为1
+            sample_weights = sample_weights / (sample_weights.mean() + 1e-8)
+        else:
+            sample_weights = None
+        
         seq_output = self.forward(item_seq, item_seq_len)
         
         # 频域解耦表示 --重新计算是为了训练频域模块
@@ -909,7 +1454,19 @@ class FRF(SequentialRecommender):
             neg_items_emb = self.item_embedding(neg_items)
             pos_score = torch.sum(seq_output * pos_items_emb, dim=-1)
             neg_score = torch.sum(seq_output * neg_items_emb, dim=-1)
-            main_loss = self.loss_fct(pos_score, neg_score)
+            
+            # 应用样本权重（如果有）
+            if sample_weights is not None:
+                try:
+                    main_loss = self.loss_fct(pos_score, neg_score, sample_weights)
+                except TypeError:
+                    # 如果BPRLoss不接受权重参数，则使用不带权重的版本
+                    main_loss = self.loss_fct(pos_score, neg_score)
+                    # 手动应用权重
+                    if hasattr(main_loss, 'item'):
+                        main_loss = (main_loss.item() * sample_weights).mean()
+            else:
+                main_loss = self.loss_fct(pos_score, neg_score)
             
             # 计算简化版对比学习损失
             contrastive_loss = self.calculate_simplified_contrast_loss(
@@ -918,7 +1475,13 @@ class FRF(SequentialRecommender):
         else:  # CE损失
             test_item_emb = self.item_embedding.weight
             logits = torch.matmul(seq_output, test_item_emb.transpose(0, 1))
-            main_loss = self.loss_fct(logits, pos_items)
+            
+            # 应用样本权重（如果有）
+            if sample_weights is not None:
+                main_loss = F.cross_entropy(logits, pos_items, reduction='none')
+                main_loss = (main_loss * sample_weights).mean()
+            else:
+                main_loss = self.loss_fct(logits, pos_items)
             
             # 对比学习损失
             pos_items_emb = self.item_embedding(pos_items)
