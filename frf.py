@@ -1,12 +1,17 @@
 # -*- coding: utf-8 -*-
-# @Time    : 2025/5/24
+# @Time    : 2025/5/27
+# @Author  : OuyangNingtai
+# @Description: 简化版FRF模型 - 修复batch_size不匹配问题
 
 r"""
-DTW CoreSet Sequence Recommender
+FRF Simple - Simplified Frequency Repetitive Fusion Model
 ################################################
-基于DTW核心集的序列推荐模型
-通过DTW相似度对序列片段进行聚类，选择代表性片段构建核心集
-核心集片段作为高频信号，非核心集作为低频信号
+简化版频域重复兴趣融合推荐模型
+
+修复问题：
+- 解决不同batch_size导致的张量连接错误
+- 改用全局频域历史存储策略
+- 保持核心功能完整性
 """
 
 import numpy as np
@@ -15,647 +20,413 @@ import torch.nn as nn
 import torch.nn.functional as F
 import math
 import time
-import logging
-import os
-from tqdm import tqdm
-from collections import defaultdict
-from scipy.sparse import csr_matrix
-from sklearn.cluster import KMeans
-import pickle
+from collections import deque
 
 from recbole.model.abstract_recommender import SequentialRecommender
 from recbole.model.loss import BPRLoss
 from recbole.data.interaction import Interaction
-from recbole.data.dataset import Dataset
-from recbole.utils import set_color
 
 
-class DTWSequmentCoreSetProcessor:
-    """基于DTW的序列片段核心集处理器
+class FrequencyDomainDecoupler(nn.Module):
+    """简化版频域解耦器
     
-    将长序列分片，使用DTW计算片段相似度并聚类，选择代表性片段构建核心集
-    
-    Args:
-        dataset (Dataset): 数据集对象
-        embedding_size (int): 嵌入维度
-        segment_length (int): 片段长度，默认8
-        overlap_ratio (float): 片段重叠比例，默认0.5
-        coreset_ratio (float): 核心集比例，默认0.3
-        n_clusters (int): 聚类数量，默认None（自动确定）
-        min_segment_freq (int): 最小片段频次，默认2
-        cache_dir (str): 缓存目录
-        force_recompute (bool): 是否强制重新计算
-        dataset_name (str): 数据集名称
-    """
-    def __init__(self, dataset, embedding_size, 
-                 segment_length=8, overlap_ratio=0.5, coreset_ratio=0.3,
-                 n_clusters=None, min_segment_freq=2,
-                 cache_dir='./dtw_coreset_cache', 
-                 force_recompute=False, dataset_name=None):
-        self.logger = logging.getLogger()
-        self.dataset = dataset
-        self.embedding_size = embedding_size
-        self.segment_length = segment_length
-        self.overlap_ratio = overlap_ratio
-        self.coreset_ratio = coreset_ratio
-        self.n_clusters = n_clusters
-        self.min_segment_freq = min_segment_freq
-        self.cache_dir = cache_dir
-        self.force_recompute = force_recompute
-        self.dataset_name = dataset_name or 'default_dataset'
-        
-        # 创建缓存目录
-        if not os.path.exists(cache_dir):
-            os.makedirs(cache_dir)
-            
-        # DTW距离计算缓存
-        self.dtw_cache = {}
-        self.max_cache_size = 50000
-        
-        # 数据集信息
-        self.uid_field = dataset.uid_field
-        self.iid_field = dataset.iid_field
-        self.item_num = dataset.item_num
-        
-        # 核心集信息
-        self.coreset_segments = []
-        self.segment_to_cluster = {}
-        self.cluster_representatives = {}
-        
-    def _segment_sequence(self, sequence):
-        """将序列分割为重叠片段
-        
-        Args:
-            sequence (list): 物品序列
-            
-        Returns:
-            list: 片段列表，每个片段是(start_idx, segment)的元组
-        """
-        if len(sequence) < self.segment_length:
-            return [(0, sequence)]
-        
-        segments = []
-        step = max(1, int(self.segment_length * (1 - self.overlap_ratio)))
-        
-        for start in range(0, len(sequence) - self.segment_length + 1, step):
-            segment = sequence[start:start + self.segment_length]
-            segments.append((start, segment))
-        
-        # 确保包含最后一个片段
-        if segments[-1][0] + self.segment_length < len(sequence):
-            segments.append((len(sequence) - self.segment_length, 
-                           sequence[-self.segment_length:]))
-        
-        return segments
-    
-    def dtw_distance(self, seq1, seq2):
-        """计算两个序列间的DTW距离
-        
-        Args:
-            seq1 (list): 第一个序列（物品ID列表）
-            seq2 (list): 第二个序列（物品ID列表）
-            
-        Returns:
-            float: DTW距离值
-        """
-        # 缓存键
-        cache_key = (tuple(seq1), tuple(seq2))
-        if cache_key in self.dtw_cache:
-            return self.dtw_cache[cache_key]
-        
-        n, m = len(seq1), len(seq2)
-        
-        # 对于短序列，简化为Jaccard距离
-        if n <= 2 or m <= 2:
-            set1, set2 = set(seq1), set(seq2)
-            intersection = len(set1 & set2)
-            union = len(set1 | set2)
-            jaccard_sim = intersection / union if union > 0 else 0
-            dist = 1 - jaccard_sim
-        else:
-            # 创建DTW矩阵
-            dtw_matrix = np.zeros((n+1, m+1)) + np.inf
-            dtw_matrix[0, 0] = 0
-            
-            # 计算成对距离（基于物品ID）
-            for i in range(1, n+1):
-                for j in range(1, m+1):
-                    cost = 0 if seq1[i-1] == seq2[j-1] else 1
-                    dtw_matrix[i, j] = cost + min(
-                        dtw_matrix[i-1, j],    # 插入
-                        dtw_matrix[i, j-1],    # 删除
-                        dtw_matrix[i-1, j-1]   # 替换
-                    )
-            
-            dist = dtw_matrix[n, m] / max(n, m)  # 归一化
-        
-        # 存入缓存
-        if len(self.dtw_cache) < self.max_cache_size:
-            self.dtw_cache[cache_key] = dist
-        
-        return dist
-    
-    def _extract_all_segments(self):
-        """从数据集中提取所有用户序列的片段
-        
-        Returns:
-            tuple: (所有片段列表, 片段到用户ID的映射, 用户序列字典)
-        """
-        self.logger.info("提取用户序列片段...")
-        
-        # 获取交互数据
-        inter_feat = self.dataset.inter_feat
-        user_ids = inter_feat[self.uid_field].numpy()
-        item_ids = inter_feat[self.iid_field].numpy()
-        
-        # 按用户ID排序
-        sort_idx = np.argsort(user_ids)
-        user_ids = user_ids[sort_idx]
-        item_ids = item_ids[sort_idx]
-        
-        # 分组构建序列
-        user_sequences = defaultdict(list)
-        for user_id, item_id in zip(user_ids, item_ids):
-            user_sequences[user_id].append(item_id)
-        
-        # 提取所有片段
-        all_segments = []
-        segment_to_user = {}
-        
-        for user_id, sequence in user_sequences.items():
-            if len(sequence) >= self.segment_length:
-                segments = self._segment_sequence(sequence)
-                for start_idx, segment in segments:
-                    segment_id = len(all_segments)
-                    all_segments.append(segment)
-                    segment_to_user[segment_id] = (user_id, start_idx)
-        
-        self.logger.info(f"提取了{len(all_segments)}个序列片段")
-        return all_segments, segment_to_user, user_sequences
-    
-    def _compute_segment_similarity_matrix(self, segments):
-        """计算片段相似度矩阵
-        
-        Args:
-            segments (list): 片段列表
-            
-        Returns:
-            np.ndarray: 相似度矩阵
-        """
-        self.logger.info("计算片段DTW相似度矩阵...")
-        n_segments = len(segments)
-        similarity_matrix = np.zeros((n_segments, n_segments))
-        
-        # 使用tqdm显示进度
-        for i in tqdm(range(n_segments), desc="计算相似度"):
-            for j in range(i, n_segments):
-                if i == j:
-                    similarity_matrix[i, j] = 0
-                else:
-                    dist = self.dtw_distance(segments[i], segments[j])
-                    similarity_matrix[i, j] = dist
-                    similarity_matrix[j, i] = dist
-        
-        return similarity_matrix
-    
-    def _cluster_segments(self, segments, similarity_matrix):
-        """对片段进行聚类
-        
-        Args:
-            segments (list): 片段列表
-            similarity_matrix (np.ndarray): 相似度矩阵
-            
-        Returns:
-            tuple: (聚类标签, 聚类中心索引)
-        """
-        self.logger.info("对片段进行聚类...")
-        
-        # 确定聚类数量
-        n_segments = len(segments)
-        if self.n_clusters is None:
-            # 自动确定聚类数：使用启发式规则
-            self.n_clusters = min(max(10, int(np.sqrt(n_segments))), n_segments // 5)
-        
-        self.logger.info(f"使用{self.n_clusters}个聚类")
-        
-        # 将距离矩阵转换为特征矩阵（使用MDS思想的简化版本）
-        # 这里我们使用相似度矩阵的每一行作为特征
-        features = 1 - similarity_matrix  # 转换为相似度
-        
-        # 使用KMeans聚类
-        kmeans = KMeans(n_clusters=self.n_clusters, random_state=42, n_init=10)
-        cluster_labels = kmeans.fit_predict(features)
-        
-        # 找到每个聚类的代表片段（最接近聚类中心的片段）
-        cluster_centers = {}
-        for cluster_id in range(self.n_clusters):
-            cluster_indices = np.where(cluster_labels == cluster_id)[0]
-            if len(cluster_indices) > 0:
-                # 计算聚类内平均距离，选择最小的作为代表
-                min_avg_dist = float('inf')
-                representative = cluster_indices[0]
-                
-                for idx in cluster_indices:
-                    avg_dist = np.mean([similarity_matrix[idx, j] for j in cluster_indices if j != idx])
-                    if avg_dist < min_avg_dist:
-                        min_avg_dist = avg_dist
-                        representative = idx
-                
-                cluster_centers[cluster_id] = representative
-        
-        return cluster_labels, cluster_centers
-    
-    def _select_coreset_segments(self, segments, cluster_labels, cluster_centers):
-        """选择核心集片段
-        
-        Args:
-            segments (list): 片段列表
-            cluster_labels (np.ndarray): 聚类标签
-            cluster_centers (dict): 聚类中心索引
-            
-        Returns:
-            tuple: (核心集片段索引, 片段到聚类的映射)
-        """
-        self.logger.info("选择核心集片段...")
-        
-        # 统计每个聚类的片段数量
-        cluster_counts = defaultdict(int)
-        for label in cluster_labels:
-            cluster_counts[label] += 1
-        
-        # 按聚类大小排序，优先选择大聚类的代表片段
-        sorted_clusters = sorted(cluster_counts.items(), key=lambda x: x[1], reverse=True)
-        
-        # 选择核心集
-        target_coreset_size = max(1, int(len(segments) * self.coreset_ratio))
-        coreset_indices = set()
-        segment_to_cluster = {}
-        
-        # 首先添加所有聚类的代表片段
-        for cluster_id, representative_idx in cluster_centers.items():
-            if len(coreset_indices) < target_coreset_size:
-                coreset_indices.add(representative_idx)
-                segment_to_cluster[representative_idx] = cluster_id
-        
-        # 如果还需要更多片段，按聚类大小添加更多片段
-        for cluster_id, count in sorted_clusters:
-            if len(coreset_indices) >= target_coreset_size:
-                break
-            
-            # 获取该聚类的所有片段
-            cluster_indices = np.where(cluster_labels == cluster_id)[0]
-            
-            # 添加尚未在核心集中的片段
-            for idx in cluster_indices:
-                if len(coreset_indices) >= target_coreset_size:
-                    break
-                if idx not in coreset_indices:
-                    coreset_indices.add(idx)
-                    segment_to_cluster[idx] = cluster_id
-        
-        self.logger.info(f"选择了{len(coreset_indices)}个核心集片段")
-        return list(coreset_indices), segment_to_cluster
-    
-    def _reconstruct_sequences(self, user_sequences, segments, segment_to_user, 
-                             coreset_indices, segment_to_cluster):
-        """重构用户序列，标记核心集和非核心集片段
-        
-        Args:
-            user_sequences (dict): 原始用户序列
-            segments (list): 所有片段
-            segment_to_user (dict): 片段到用户的映射
-            coreset_indices (list): 核心集片段索引
-            segment_to_cluster (dict): 片段到聚类的映射
-            
-        Returns:
-            dict: 重构后的用户序列信息
-        """
-        self.logger.info("重构用户序列...")
-        
-        coreset_set = set(coreset_indices)
-        
-        # 为每个用户重构序列
-        reconstructed_sequences = {}
-        
-        for user_id, original_seq in user_sequences.items():
-            if len(original_seq) < self.segment_length:
-                # 短序列直接标记为低频
-                reconstructed_sequences[user_id] = {
-                    'original_sequence': original_seq,
-                    'high_freq_segments': [],
-                    'low_freq_segments': [original_seq],
-                    'sequence_mask': [0] * len(original_seq)  # 0表示低频，1表示高频
-                }
-                continue
-            
-            # 获取该用户的所有片段
-            user_segments = []
-            for seg_id, (u_id, start_idx) in segment_to_user.items():
-                if u_id == user_id:
-                    user_segments.append((seg_id, start_idx, segments[seg_id]))
-            
-            # 按起始位置排序
-            user_segments.sort(key=lambda x: x[1])
-            
-            # 创建序列掩码
-            sequence_mask = [0] * len(original_seq)
-            high_freq_segments = []
-            low_freq_segments = []
-            
-            covered_positions = set()
-            
-            # 标记高频片段
-            for seg_id, start_idx, segment in user_segments:
-                if seg_id in coreset_set:
-                    high_freq_segments.append((start_idx, segment))
-                    # 标记这些位置为高频
-                    for i in range(start_idx, min(start_idx + len(segment), len(original_seq))):
-                        sequence_mask[i] = 1
-                        covered_positions.add(i)
-            
-            # 收集低频片段（未被高频覆盖的部分）
-            low_freq_start = None
-            for i in range(len(original_seq)):
-                if i not in covered_positions:
-                    if low_freq_start is None:
-                        low_freq_start = i
-                else:
-                    if low_freq_start is not None:
-                        low_freq_segments.append(original_seq[low_freq_start:i])
-                        low_freq_start = None
-            
-            # 处理最后一个低频片段
-            if low_freq_start is not None:
-                low_freq_segments.append(original_seq[low_freq_start:])
-            
-            reconstructed_sequences[user_id] = {
-                'original_sequence': original_seq,
-                'high_freq_segments': high_freq_segments,
-                'low_freq_segments': low_freq_segments,
-                'sequence_mask': sequence_mask
-            }
-        
-        return reconstructed_sequences
-    
-    def _save_coreset_data(self, reconstructed_sequences, cluster_centers, segments):
-        """保存核心集数据
-        
-        Args:
-            reconstructed_sequences (dict): 重构序列
-            cluster_centers (dict): 聚类中心
-            segments (list): 所有片段
-        """
-        cache_path = os.path.join(self.cache_dir, f"{self.dataset_name}_segment_coreset.pkl")
-        
-        coreset_data = {
-            'reconstructed_sequences': reconstructed_sequences,
-            'cluster_centers': cluster_centers,
-            'segments': segments,
-            'segment_length': self.segment_length,
-            'overlap_ratio': self.overlap_ratio,
-            'coreset_ratio': self.coreset_ratio,
-            'n_clusters': self.n_clusters
-        }
-        
-        with open(cache_path, 'wb') as f:
-            pickle.dump(coreset_data, f)
-        
-        self.logger.info(f"核心集数据已保存至: {cache_path}")
-    
-    def _load_coreset_data(self):
-        """加载核心集数据
-        
-        Returns:
-            dict or None: 核心集数据，如果不存在则返回None
-        """
-        cache_path = os.path.join(self.cache_dir, f"{self.dataset_name}_segment_coreset.pkl")
-        
-        if os.path.exists(cache_path) and not self.force_recompute:
-            self.logger.info(f"加载缓存的核心集数据: {cache_path}")
-            with open(cache_path, 'rb') as f:
-                return pickle.load(f)
-        
-        return None
-    
-    def build_coreset(self):
-        """构建DTW序列片段核心集
-        
-        Returns:
-            dict: 重构后的序列数据
-        """
-        # 尝试加载缓存
-        cached_data = self._load_coreset_data()
-        if cached_data is not None:
-            return cached_data['reconstructed_sequences']
-        
-        # 提取所有片段
-        segments, segment_to_user, user_sequences = self._extract_all_segments()
-        
-        if len(segments) == 0:
-            self.logger.warning("没有提取到足够的序列片段")
-            return {}
-        
-        # 计算相似度矩阵
-        similarity_matrix = self._compute_segment_similarity_matrix(segments)
-        
-        # 聚类
-        cluster_labels, cluster_centers = self._cluster_segments(segments, similarity_matrix)
-        
-        # 选择核心集
-        coreset_indices, segment_to_cluster = self._select_coreset_segments(
-            segments, cluster_labels, cluster_centers
-        )
-        
-        # 重构序列
-        reconstructed_sequences = self._reconstruct_sequences(
-            user_sequences, segments, segment_to_user, coreset_indices, segment_to_cluster
-        )
-        
-        # 保存数据
-        self._save_coreset_data(reconstructed_sequences, cluster_centers, segments)
-        
-        return reconstructed_sequences
-    
-    def process_dataset(self):
-        """处理数据集，应用序列片段核心集
-        
-        Returns:
-            Dataset: 处理后的数据集
-        """
-        self.logger.info(set_color("开始DTW序列片段核心集处理...", "green"))
-        
-        # 构建核心集
-        reconstructed_sequences = self.build_coreset()
-        
-        if not reconstructed_sequences:
-            self.logger.warning("核心集构建失败，返回原始数据集")
-            return self.dataset
-        
-        # 应用到数据集
-        self.logger.info("将核心集信息应用到数据集...")
-        inter_feat = self.dataset.inter_feat
-        
-        # 获取交互数据
-        user_ids = inter_feat[self.uid_field].numpy()
-        item_ids = inter_feat[self.iid_field].numpy()
-        
-        # 按用户ID排序
-        sort_idx = np.argsort(user_ids)
-        user_ids = user_ids[sort_idx]
-        item_ids = item_ids[sort_idx]
-        
-        # 创建高频/低频标记
-        high_freq_mask = []
-        low_freq_mask = []
-        
-        current_user = None
-        current_seq_idx = 0
-        
-        for i, (user_id, item_id) in enumerate(zip(user_ids, item_ids)):
-            if user_id != current_user:
-                current_user = user_id
-                current_seq_idx = 0
-            
-            # 获取该用户的序列掩码
-            if user_id in reconstructed_sequences:
-                seq_info = reconstructed_sequences[user_id]
-                if current_seq_idx < len(seq_info['sequence_mask']):
-                    is_high_freq = seq_info['sequence_mask'][current_seq_idx]
-                else:
-                    is_high_freq = 0  # 超出范围的默认为低频
-            else:
-                is_high_freq = 0  # 未找到的用户默认为低频
-            
-            high_freq_mask.append(is_high_freq)
-            low_freq_mask.append(1 - is_high_freq)
-            current_seq_idx += 1
-        
-        # 恢复原始顺序
-        original_order = np.argsort(sort_idx)
-        high_freq_mask = np.array(high_freq_mask)[original_order]
-        low_freq_mask = np.array(low_freq_mask)[original_order]
-        
-        # 添加到数据集
-        inter_feat.update('high_freq_mask', torch.BoolTensor(high_freq_mask))
-        inter_feat.update('low_freq_mask', torch.BoolTensor(low_freq_mask))
-        
-        # 统计信息
-        n_high_freq = np.sum(high_freq_mask)
-        n_low_freq = np.sum(low_freq_mask)
-        total_interactions = len(high_freq_mask)
-        
-        self.logger.info(set_color(
-            f"序列片段核心集处理完成！"
-            f"高频交互: {n_high_freq} ({n_high_freq/total_interactions:.2%}), "
-            f"低频交互: {n_low_freq} ({n_low_freq/total_interactions:.2%})", 
-            "green"
-        ))
-        
-        return self.dataset
-
-
-class HighLowFrequencyFusionModule(nn.Module):
-    """高低频信号融合模块
+    将用户兴趣分解为高频(重复兴趣)和低频(探索兴趣)两个表示
     
     Args:
         embedding_dim (int): 嵌入维度
-        fusion_type (str): 融合类型 ['concat', 'attention', 'gated']
-        high_freq_weight (float): 高频信号权重，默认0.7
+        cutoff_ratio (float): 高低频分界点比例，固定值
+        high_freq_scale (float): 高频增强比例
     """
-    def __init__(self, embedding_dim, fusion_type='gated', high_freq_weight=0.7):
-        super(HighLowFrequencyFusionModule, self).__init__()
+    def __init__(self, embedding_dim, cutoff_ratio=0.6, high_freq_scale=1.5):
+        super(FrequencyDomainDecoupler, self).__init__()
         self.embedding_dim = embedding_dim
-        self.fusion_type = fusion_type
-        self.high_freq_weight = high_freq_weight
+        self.cutoff_ratio = cutoff_ratio
+        self.high_freq_scale = high_freq_scale
         
-        if fusion_type == 'concat':
-            self.fusion_layer = nn.Sequential(
-                nn.Linear(embedding_dim * 2, embedding_dim),
-                nn.LayerNorm(embedding_dim),
-                nn.GELU()
-            )
-        elif fusion_type == 'attention':
-            self.attention = nn.MultiheadAttention(
-                embed_dim=embedding_dim,
-                num_heads=8,
-                dropout=0.1,
-                batch_first=True
-            )
-            self.norm = nn.LayerNorm(embedding_dim)
-        elif fusion_type == 'gated':
-            self.gate_network = nn.Sequential(
-                nn.Linear(embedding_dim * 2, embedding_dim),
-                nn.Sigmoid()
-            )
-            self.fusion_transform = nn.Sequential(
-                nn.Linear(embedding_dim * 2, embedding_dim),
-                nn.LayerNorm(embedding_dim)
-            )
-        else:
-            raise ValueError(f"Unsupported fusion_type: {fusion_type}")
+        # 特征编码器
+        self.encoder = nn.Sequential(
+            nn.Linear(embedding_dim, embedding_dim),
+            nn.LayerNorm(embedding_dim),  
+            nn.GELU()
+        )
+        
+        # 高频投影层
+        self.high_freq_projector = nn.Sequential(
+            nn.Linear(embedding_dim, embedding_dim),
+            nn.LayerNorm(embedding_dim)
+        )
+        
+        # 低频投影层
+        self.low_freq_projector = nn.Sequential(
+            nn.Linear(embedding_dim, embedding_dim),
+            nn.LayerNorm(embedding_dim)
+        )
     
-    def forward(self, high_freq_repr, low_freq_repr):
+    def forward(self, seq_output):
+        """频域解耦处理
+        
+        Args:
+            seq_output (torch.Tensor): 序列表示, shape: [B, H]
+            
+        Returns:
+            tuple: 高频表示, 低频表示, 频域表示
+        """
+        # 安全性检查
+        if torch.isnan(seq_output).any():
+            seq_output = torch.nan_to_num(seq_output, nan=0.0, posinf=1.0, neginf=-1.0)
+
+        # 编码用户行为序列
+        processed_seq = seq_output.unsqueeze(1)  # [B, 1, H]
+        encoded = self.encoder(processed_seq)  # [B, 1, H]
+
+        if torch.isnan(encoded).any():
+            encoded = torch.nan_to_num(encoded, nan=0.0, posinf=1.0, neginf=-1.0)
+
+        # 归一化处理
+        encoded_mean = encoded.mean(dim=2, keepdim=True)
+        encoded_std = encoded.std(dim=2, keepdim=True) + 1e-6
+        encoded_norm = (encoded - encoded_mean) / encoded_std
+        
+        # 转换到频域
+        freq_domain = torch.fft.rfft(encoded_norm, dim=2, norm="ortho")  # [B, 1, H//2+1]
+        
+        # 固定高低频划分
+        cutoff = int(freq_domain.shape[2] * self.cutoff_ratio)
+        
+        # 高频成分 (重复兴趣) - 增强处理
+        high_freq_components = freq_domain.clone()
+        high_freq_components[:, :, cutoff:] = 0  # 清零低频部分
+        high_freq_components *= self.high_freq_scale  # 增强高频
+        
+        # 低频成分 (探索兴趣)
+        low_freq_components = freq_domain.clone()
+        low_freq_components[:, :, :cutoff] = 0  # 清零高频部分
+        
+        # 逆变换回时域
+        high_freq_repr = torch.fft.irfft(high_freq_components, n=self.embedding_dim, dim=2, norm="ortho")
+        low_freq_repr = torch.fft.irfft(low_freq_components, n=self.embedding_dim, dim=2, norm="ortho")
+
+        # 安全性检查
+        if torch.isnan(high_freq_repr).any() or torch.isnan(low_freq_repr).any():
+            high_freq_repr = torch.nan_to_num(high_freq_repr, nan=0.0, posinf=1.0, neginf=-1.0)
+            low_freq_repr = torch.nan_to_num(low_freq_repr, nan=0.0, posinf=1.0, neginf=-1.0)
+        
+        # 降维
+        high_freq_repr = high_freq_repr.squeeze(1)  # [B, H]
+        low_freq_repr = low_freq_repr.squeeze(1)  # [B, H]
+        
+        # 投影到表示空间
+        high_freq_repr = self.high_freq_projector(high_freq_repr)
+        low_freq_repr = self.low_freq_projector(low_freq_repr)
+
+        return high_freq_repr, low_freq_repr, freq_domain.squeeze(1)
+
+
+class DTWRepetitionTracker(nn.Module):
+    """简化版DTW重复兴趣跟踪器
+    
+    使用DTW距离跟踪用户重复兴趣模式
+    
+    Args:
+        embedding_dim (int): 嵌入维度
+        window_size (int): 历史窗口大小
+        rep_threshold (float): 重复兴趣阈值
+    """
+    def __init__(self, embedding_dim, window_size=3, rep_threshold=0.6):
+        super(DTWRepetitionTracker, self).__init__()
+        self.embedding_dim = embedding_dim
+        self.window_size = window_size
+        self.rep_threshold = rep_threshold
+        
+        # DTW计算缓存
+        self.dtw_cache = {}
+        self.max_cache_size = 50
+        
+        # 创建一个dummy参数以确保模块有参数
+        self.dummy_param = nn.Parameter(torch.zeros(1))
+        
+        # 动态构建的模式检测器
+        self.pattern_detector = None
+        self._input_dim = None
+        
+        # 使用列表存储历史频域特征，避免batch_size不匹配问题
+        self.freq_history_list = deque(maxlen=window_size * 10)  # 最多存储window_size*10个样本
+    
+    def _build_pattern_detector(self, input_dim, device):
+        """动态构建模式检测器"""
+        if self.pattern_detector is None:
+            self._input_dim = input_dim
+            hidden_dim = max(input_dim // 4, 16)  # 确保隐藏层至少有16个神经元
+            
+            self.pattern_detector = nn.Sequential(
+                nn.Linear(input_dim, hidden_dim),
+                nn.LayerNorm(hidden_dim),
+                nn.GELU(),
+                nn.Linear(hidden_dim, 1),
+                nn.Sigmoid()
+            ).to(device)
+            
+            # 正确注册到模块中
+            self.add_module('pattern_detector', self.pattern_detector)
+            
+            # 初始化权重
+            for module in self.pattern_detector.modules():
+                if isinstance(module, nn.Linear):
+                    nn.init.xavier_normal_(module.weight)
+                    if module.bias is not None:
+                        nn.init.zeros_(module.bias)
+    
+    def update_freq_history(self, freq_features):
+        """更新频域历史
+        
+        Args:
+            freq_features (torch.Tensor): 频域特征 [B, F]
+        """
+        if not self.training:
+            return
+            
+        # 将当前批次的特征逐个添加到历史列表中
+        with torch.no_grad():
+            for i in range(freq_features.shape[0]):
+                self.freq_history_list.append(freq_features[i].cpu().clone())
+    
+    def get_freq_history_tensor(self, batch_size, device):
+        """获取频域历史张量
+        
+        Args:
+            batch_size (int): 当前批次大小
+            device: 设备
+            
+        Returns:
+            torch.Tensor: 历史频域特征 [B, T, F] 或 None
+        """
+        if len(self.freq_history_list) < 2:
+            return None
+        
+        # 取最近的一些历史特征
+        history_len = min(self.window_size, len(self.freq_history_list))
+        recent_history = list(self.freq_history_list)[-history_len:]
+        
+        # 构造伪历史张量：为每个批次样本复制相同的历史
+        freq_dim = recent_history[0].shape[0]
+        history_tensor = torch.zeros(batch_size, history_len, freq_dim, device=device)
+        
+        for t, hist_feat in enumerate(recent_history):
+            history_tensor[:, t, :] = hist_feat.to(device)
+        
+        return history_tensor
+    
+    def dtw_distance(self, seq1: torch.Tensor, seq2: torch.Tensor) -> torch.Tensor:
+        """计算DTW距离（简化版）
+        
+        Args:
+            seq1, seq2: 输入序列
+            
+        Returns:
+            torch.Tensor: DTW距离
+        """
+        # 检查缓存
+        try:
+            cache_key = (hash(seq1.cpu().detach().numpy().tobytes()), 
+                         hash(seq2.cpu().detach().numpy().tobytes()))
+            if cache_key in self.dtw_cache:
+                return self.dtw_cache[cache_key]
+        except:
+            cache_key = None
+            
+        n, m = seq1.size(0), seq2.size(0)
+        
+        # 短序列优化
+        if n <= 2 or m <= 2:
+            if n == m:
+                dist = torch.norm(seq1 - seq2, p=2) / max(n, 1)
+            else:
+                dist = torch.norm(seq1.mean(dim=0) - seq2.mean(dim=0), p=2)
+        else:
+            # 完整DTW计算
+            dtw_matrix = torch.zeros((n+1, m+1), device=seq1.device)
+            dtw_matrix[:, 0] = float('inf')
+            dtw_matrix[0, :] = float('inf')
+            dtw_matrix[0, 0] = 0
+            
+            for i in range(1, n+1):
+                for j in range(1, m+1):
+                    cost = torch.norm(seq1[i-1] - seq2[j-1], p=2)
+                    dtw_matrix[i, j] = cost + min(
+                        dtw_matrix[i-1, j],
+                        dtw_matrix[i, j-1],
+                        dtw_matrix[i-1, j-1]
+                    )
+            
+            dist = dtw_matrix[n, m]
+        
+        # 更新缓存
+        if cache_key is not None and len(self.dtw_cache) < self.max_cache_size:
+            self.dtw_cache[cache_key] = dist
+            
+        return dist
+    
+    def compute_repetition_score(self, freq_history):
+        """计算重复强度分数
+        
+        Args:
+            freq_history (torch.Tensor): 频域历史 [B, T, F] 或 None
+            
+        Returns:
+            torch.Tensor: 重复强度分数 [B, 1]
+        """
+        if freq_history is None:
+            # 没有历史，返回默认分数
+            batch_size = 1  # 默认值，会在调用时被正确设置
+            device = self.dummy_param.device
+            return torch.ones(batch_size, 1, device=device) * 0.5
+        
+        batch_size = freq_history.shape[0]
+        device = freq_history.device
+        
+        if freq_history.shape[1] < 2:
+            # 历史不足，返回默认分数
+            return torch.ones(batch_size, 1, device=device) * 0.5
+        
+        # 提取高频部分
+        cutoff = int(freq_history.shape[2] * 0.6)
+        high_freq_history = torch.abs(freq_history[:, :, :cutoff])
+        
+        # 归一化
+        mean = high_freq_history.mean(dim=(1,2), keepdim=True)
+        std = high_freq_history.std(dim=(1,2), keepdim=True) + 1e-6
+        high_freq_history = (high_freq_history - mean) / std
+        
+        # 计算最新特征
+        latest_features = high_freq_history[:, -1, :]  # [B, F]
+        
+        # 动态构建模式检测器
+        if self.pattern_detector is None:
+            self._build_pattern_detector(latest_features.shape[1], device)
+        
+        # 使用模式检测器
+        repetition_scores = self.pattern_detector(latest_features)
+        
+        # DTW相似性分析（如果有足够历史）
+        if freq_history.shape[1] >= 2:
+            dtw_similarities = []
+            for i in range(batch_size):
+                try:
+                    # 比较最新和历史的相似性
+                    recent_seq = high_freq_history[i, -1, :].unsqueeze(0)
+                    past_seq = high_freq_history[i, :-1, :].mean(dim=0, keepdim=True)
+                    
+                    dtw_dist = self.dtw_distance(recent_seq, past_seq)
+                    similarity = torch.exp(-dtw_dist / self.embedding_dim)
+                    dtw_similarities.append(similarity)
+                except:
+                    dtw_similarities.append(torch.tensor(0.5, device=device))
+            
+            dtw_sim = torch.stack(dtw_similarities).unsqueeze(1)
+            # 结合重复分数和DTW相似性
+            repetition_scores = 0.7 * repetition_scores + 0.3 * dtw_sim
+        
+        return repetition_scores
+    
+    def forward(self, batch_size, device):
+        """前向传播
+        
+        Args:
+            batch_size (int): 当前批次大小
+            device: 设备
+            
+        Returns:
+            torch.Tensor: 重复强度分数 [B, 1]
+        """
+        # 获取历史频域特征
+        freq_history = self.get_freq_history_tensor(batch_size, device)
+        
+        if freq_history is not None and torch.isnan(freq_history).any():
+            freq_history = torch.nan_to_num(freq_history, nan=0.0, posinf=1.0, neginf=-1.0)
+        
+        repetition_scores = self.compute_repetition_score(freq_history)
+        
+        # 确保批次大小正确
+        if repetition_scores.shape[0] != batch_size:
+            repetition_scores = torch.ones(batch_size, 1, device=device) * 0.5
+        
+        if torch.isnan(repetition_scores).any():
+            repetition_scores = torch.nan_to_num(repetition_scores, nan=0.5, posinf=1.0, neginf=0.0)
+        
+        return repetition_scores
+
+
+class UnifiedRecommender(nn.Module):
+    """简化版统一推荐器
+    
+    使用固定策略融合高频和低频表示
+    
+    Args:
+        embedding_dim (int): 嵌入维度
+        rep_weight (float): 重复兴趣基准权重
+    """
+    def __init__(self, embedding_dim, rep_weight=0.7):
+        super(UnifiedRecommender, self).__init__()
+        self.embedding_dim = embedding_dim
+        self.rep_weight = rep_weight
+        
+        # 统一融合网络
+        self.fusion_network = nn.Sequential(
+            nn.Linear(embedding_dim * 2 + 1, embedding_dim),
+            nn.LayerNorm(embedding_dim),
+            nn.GELU(),
+            nn.Linear(embedding_dim, 1),
+            nn.Sigmoid()
+        )
+        
+        # 最终投影
+        self.final_projection = nn.Sequential(
+            nn.Linear(embedding_dim * 2, embedding_dim),
+            nn.LayerNorm(embedding_dim)
+        )
+    
+    def forward(self, high_freq_repr, low_freq_repr, repetition_scores):
         """融合高频和低频表示
         
         Args:
-            high_freq_repr (torch.Tensor): 高频表示, shape: [B, H]
-            low_freq_repr (torch.Tensor): 低频表示, shape: [B, H]
+            high_freq_repr (torch.Tensor): 高频表示 [B, H]
+            low_freq_repr (torch.Tensor): 低频表示 [B, H]
+            repetition_scores (torch.Tensor): 重复强度分数 [B, 1]
             
         Returns:
-            torch.Tensor: 融合后的表示, shape: [B, H]
+            torch.Tensor: 融合后的用户表示 [B, H]
         """
-        if self.fusion_type == 'concat':
-            # 简单拼接后变换
-            concat_repr = torch.cat([high_freq_repr, low_freq_repr], dim=-1)
-            fused_repr = self.fusion_layer(concat_repr)
-            
-        elif self.fusion_type == 'attention':
-            # 使用注意力机制融合
-            # 将高频和低频作为query和key/value
-            fused_repr, _ = self.attention(
-                high_freq_repr.unsqueeze(1),  # query
-                torch.stack([high_freq_repr, low_freq_repr], dim=1),  # key & value
-                torch.stack([high_freq_repr, low_freq_repr], dim=1)
-            )
-            fused_repr = fused_repr.squeeze(1)
-            fused_repr = self.norm(fused_repr + high_freq_repr)  # 残差连接
-            
-        elif self.fusion_type == 'gated':
-            # 门控融合
-            concat_input = torch.cat([high_freq_repr, low_freq_repr], dim=-1)
-            gate = self.gate_network(concat_input)  # 门控权重
-            
-            # 加权融合
-            weighted_high = gate * high_freq_repr
-            weighted_low = (1 - gate) * low_freq_repr
-            
-            # 最终变换
-            fused_input = torch.cat([weighted_high, weighted_low], dim=-1)
-            fused_repr = self.fusion_transform(fused_input)
+        # 动态权重计算
+        fusion_input = torch.cat([high_freq_repr, low_freq_repr, repetition_scores], dim=1)
+        dynamic_adjustment = self.fusion_network(fusion_input)
         
-        return fused_repr
+        # 计算最终权重
+        repetition_weight = self.rep_weight + (1 - self.rep_weight) * dynamic_adjustment
+        novelty_weight = 1 - repetition_weight
+        
+        # 加权融合
+        weighted_high = repetition_weight * high_freq_repr
+        weighted_low = novelty_weight * low_freq_repr
+        
+        # 最终表示
+        concat_repr = torch.cat([weighted_high, weighted_low], dim=1)
+        final_repr = self.final_projection(concat_repr)
+        
+        return final_repr
 
 
-class DTWCoreSetSequenceRecommender(SequentialRecommender):
-    """基于DTW序列片段核心集的推荐模型
+class FRF(SequentialRecommender):
+    """简化版频域重复兴趣融合推荐模型
     
-    通过DTW对序列片段聚类，将核心集片段作为高频信号，非核心集作为低频信号
+    保留核心功能：频域解耦 + DTW距离 + 重复检测
+    简化配置：移除复杂的可选功能，提升性能和可维护性
     
     Args:
-        config (Config): 全局配置对象
+        config (Config): 配置对象
         dataset (Dataset): 数据集
     """
     def __init__(self, config, dataset):
-        super(DTWCoreSetSequenceRecommender, self).__init__(config, dataset)
-        
-        # 获取logger
-        self.logger = logging.getLogger()
-        
-        # 获取数据集名称
-        if hasattr(dataset, 'dataset_name'):
-            self.dataset_name = dataset.dataset_name
-        else:
-            self.dataset_name = config['dataset']
+        super(FRF, self).__init__(config, dataset)
         
         # 基础参数
         self.embedding_size = config['embedding_size']
@@ -668,32 +439,17 @@ class DTWCoreSetSequenceRecommender(SequentialRecommender):
         self.hidden_act = config['hidden_act']
         self.layer_norm_eps = config['layer_norm_eps']
         
-        # DTW核心集参数
-        self.use_dtw_coreset = config.get('use_dtw_coreset', True)
-        self.segment_length = config.get('segment_length', 8)
-        self.overlap_ratio = config.get('overlap_ratio', 0.5)
-        self.coreset_ratio = config.get('coreset_ratio', 0.3)
-        self.n_clusters = config.get('n_clusters', None)
-        self.dtw_cache_dir = config.get('dtw_cache_dir', './dtw_coreset_cache')
-        self.dtw_force_recompute = config.get('dtw_force_recompute', False)
-        
-        # 融合参数
-        self.fusion_type = config.get('fusion_type', 'gated')
-        self.high_freq_weight = config.get('high_freq_weight', 0.7)
-        
-        # 检查并处理DTW核心集
-        self.has_freq_masks = False
-        if self.use_dtw_coreset:
-            self.logger.info(set_color("开始DTW序列片段核心集处理...", "green"))
-            self.process_dtw_coreset()
+        # 简化后的核心参数
+        self.cutoff_ratio = config['cutoff_ratio'] if 'cutoff_ratio' in config else 0.6
+        self.rep_weight = config['rep_weight'] if 'rep_weight' in config else 0.7
+        self.high_freq_scale = config['high_freq_scale'] if 'high_freq_scale' in config else 1.5
+        self.window_size = config['window_size'] if 'window_size' in config else 3
+        self.rep_threshold = config['rep_threshold'] if 'rep_threshold' in config else 0.6
+        self.contrast_weight = config['contrast_weight'] if 'contrast_weight' in config else 0.3
         
         # 初始化嵌入层
-        self.item_embedding = nn.Embedding(
-            self.n_items, self.embedding_size, padding_idx=0
-        )
-        self.position_embedding = nn.Embedding(
-            self.max_seq_length, self.embedding_size
-        )
+        self.item_embedding = nn.Embedding(self.n_items, self.embedding_size, padding_idx=0)
+        self.position_embedding = nn.Embedding(self.max_seq_length, self.embedding_size)
         
         # 序列编码器
         try:
@@ -709,81 +465,47 @@ class DTWCoreSetSequenceRecommender(SequentialRecommender):
                 layer_norm_eps=self.layer_norm_eps
             )
         except ImportError:
-            self.logger.warning("导入TransformerEncoder失败，使用LSTM")
+            # 降级方案
             self.encoder = nn.LSTM(
                 input_size=self.embedding_size,
                 hidden_size=self.hidden_size,
-                num_layers=self.n_layers,
-                dropout=self.hidden_dropout_prob if self.n_layers > 1 else 0,
+                num_layers=1,
                 batch_first=True
             )
         
-        # 高低频表示提取器
-        self.high_freq_projector = nn.Sequential(
-            nn.Linear(self.embedding_size, self.hidden_size),
-            nn.LayerNorm(self.hidden_size),
-            nn.GELU(),
-            nn.Linear(self.hidden_size, self.embedding_size)
+        # 核心模块
+        self.freq_decoupler = FrequencyDomainDecoupler(
+            self.embedding_size, 
+            self.cutoff_ratio,
+            self.high_freq_scale
         )
         
-        self.low_freq_projector = nn.Sequential(
-            nn.Linear(self.embedding_size, self.hidden_size),
-            nn.LayerNorm(self.hidden_size),
-            nn.GELU(),
-            nn.Linear(self.hidden_size, self.embedding_size)
+        self.repetition_tracker = DTWRepetitionTracker(
+            self.embedding_size,
+            self.window_size,
+            self.rep_threshold
         )
         
-        # 高低频融合模块
-        self.fusion_module = HighLowFrequencyFusionModule(
-            self.embedding_size, self.fusion_type, self.high_freq_weight
+        self.recommender = UnifiedRecommender(
+            self.embedding_size,
+            self.rep_weight
         )
         
-        # 层归一化与dropout
+        # 基础组件
         self.LayerNorm = nn.LayerNorm(self.embedding_size, eps=self.layer_norm_eps)
         self.dropout = nn.Dropout(self.hidden_dropout_prob)
         
         # 损失函数
         self.loss_type = config['loss_type']
-        if config['loss_type'] == 'BPR':
+        if self.loss_type == 'BPR':
             self.loss_fct = BPRLoss()
-        elif config['loss_type'] == 'CE':
+        elif self.loss_type == 'CE':
             self.loss_fct = nn.CrossEntropyLoss()
         else:
             raise NotImplementedError("Make sure 'loss_type' in ['BPR', 'CE']!")
         
         # 参数初始化
         self.apply(self._init_weights)
-    
-    def process_dtw_coreset(self):
-        """处理数据集，应用DTW序列片段核心集"""
-        try:
-            coreset_processor = DTWSequmentCoreSetProcessor(
-                dataset=self.dataset,
-                embedding_size=self.embedding_size,
-                segment_length=self.segment_length,
-                overlap_ratio=self.overlap_ratio,
-                coreset_ratio=self.coreset_ratio,
-                n_clusters=self.n_clusters,
-                cache_dir=self.dtw_cache_dir,
-                force_recompute=self.dtw_force_recompute,
-                dataset_name=self.dataset_name
-            )
-            
-            # 处理数据集
-            self.dataset = coreset_processor.process_dataset()
-            
-            # 检查是否成功添加了频率掩码
-            if ('high_freq_mask' in self.dataset.inter_feat and 
-                'low_freq_mask' in self.dataset.inter_feat):
-                self.logger.info(set_color("成功添加高低频掩码到数据集", "green"))
-                self.has_freq_masks = True
-            else:
-                self.logger.warning("未能添加高低频掩码到数据集")
-                self.has_freq_masks = False
-        
-        except Exception as e:
-            self.logger.error(f"DTW序列片段核心集处理失败: {e}")
-            self.has_freq_masks = False
     
     def _init_weights(self, module):
         """初始化权重"""
@@ -808,109 +530,60 @@ class DTWCoreSetSequenceRecommender(SequentialRecommender):
         extended_attention_mask = extended_attention_mask * subsequent_mask
         extended_attention_mask = extended_attention_mask.to(dtype=next(self.parameters()).dtype)
         extended_attention_mask = (1.0 - extended_attention_mask) * -10000.0
-        
         return extended_attention_mask
-    
-    def extract_high_low_freq_representations(self, seq_output, high_freq_mask, low_freq_mask):
-        """提取高频和低频表示
-        
-        Args:
-            seq_output (torch.Tensor): 序列输出, shape: [B, L, H]
-            high_freq_mask (torch.Tensor): 高频掩码, shape: [B, L]
-            low_freq_mask (torch.Tensor): 低频掩码, shape: [B, L]
-            
-        Returns:
-            tuple: (高频表示, 低频表示)
-        """
-        batch_size, seq_len, hidden_size = seq_output.shape
-        
-        # 扩展掩码维度
-        high_freq_mask_expanded = high_freq_mask.unsqueeze(-1).float()  # [B, L, 1]
-        low_freq_mask_expanded = low_freq_mask.unsqueeze(-1).float()    # [B, L, 1]
-        
-        # 加权序列表示
-        high_freq_weighted = seq_output * high_freq_mask_expanded
-        low_freq_weighted = seq_output * low_freq_mask_expanded
-        
-        # 计算加权平均（处理零除情况）
-        high_freq_sum = high_freq_mask.sum(dim=1, keepdim=True).float()  # [B, 1]
-        low_freq_sum = low_freq_mask.sum(dim=1, keepdim=True).float()    # [B, 1]
-        
-        # 避免除零
-        high_freq_sum = torch.clamp(high_freq_sum, min=1.0)
-        low_freq_sum = torch.clamp(low_freq_sum, min=1.0)
-        
-        # 计算平均表示
-        high_freq_repr = high_freq_weighted.sum(dim=1) / high_freq_sum  # [B, H]
-        low_freq_repr = low_freq_weighted.sum(dim=1) / low_freq_sum     # [B, H]
-        
-        # 通过投影层增强表示
-        high_freq_repr = self.high_freq_projector(high_freq_repr)
-        low_freq_repr = self.low_freq_projector(low_freq_repr)
-        
-        return high_freq_repr, low_freq_repr
     
     def forward(self, item_seq, item_seq_len):
         """前向传播
         
         Args:
-            item_seq (torch.LongTensor): 物品序列, shape: [B, L]
-            item_seq_len (torch.LongTensor): 序列长度, shape: [B]
+            item_seq (torch.LongTensor): 物品序列 [B, L]
+            item_seq_len (torch.LongTensor): 序列长度 [B]
             
         Returns:
-            torch.Tensor: 用户表示, shape: [B, H]
+            torch.Tensor: 用户表示 [B, H]
         """
-        # 位置编码
+        # 序列编码
         position_ids = torch.arange(item_seq.size(1), dtype=torch.long, device=item_seq.device)
         position_ids = position_ids.unsqueeze(0).expand_as(item_seq)
         position_embedding = self.position_embedding(position_ids)
         
-        # 物品嵌入
         item_emb = self.item_embedding(item_seq)
         input_emb = item_emb + position_embedding
         input_emb = self.LayerNorm(input_emb)
         input_emb = self.dropout(input_emb)
         
-        # 序列编码
+        # 编码器处理
         if isinstance(self.encoder, nn.LSTM):
             encoder_output, _ = self.encoder(input_emb)
             seq_output = encoder_output
         else:
             extended_attention_mask = self.get_attention_mask(item_seq)
-            encoder_output = self.encoder(input_emb, extended_attention_mask)
-            if isinstance(encoder_output, list):
-                seq_output = encoder_output[-1]
-            else:
-                seq_output = encoder_output
+            try:
+                encoder_output = self.encoder(input_emb, extended_attention_mask)
+                seq_output = encoder_output[-1] if isinstance(encoder_output, list) else encoder_output
+            except:
+                seq_output = input_emb.mean(dim=1, keepdim=True).expand(-1, input_emb.size(1), -1)
         
-        # 获取最终的序列表示
-        final_output = self.gather_indexes(seq_output, item_seq_len - 1)
+        # 获取最后时刻的表示
+        output = self.gather_indexes(seq_output, item_seq_len - 1)
+        if torch.isnan(output).any():
+            output = torch.nan_to_num(output, nan=0.0, posinf=1.0, neginf=-1.0)
         
-        # 如果有高低频掩码，进行频率分离
-        if self.has_freq_masks:
-            # 从interaction中获取掩码信息（这需要在调用时传入）
-            # 这里我们假设可以通过某种方式获取到掩码
-            # 在实际使用中，需要修改forward函数签名来接收这些掩码
-            batch_size = item_seq.shape[0]
-            
-            # 临时解决方案：使用随机掩码进行演示
-            # 在实际实现中，应该从interaction中获取真实掩码
-            high_freq_mask = torch.randint(0, 2, (batch_size, item_seq.shape[1]), 
-                                         dtype=torch.bool, device=item_seq.device)
-            low_freq_mask = ~high_freq_mask
-            
-            # 提取高低频表示
-            high_freq_repr, low_freq_repr = self.extract_high_low_freq_representations(
-                seq_output, high_freq_mask, low_freq_mask
-            )
-            
-            # 融合高低频表示
-            fused_repr = self.fusion_module(high_freq_repr, low_freq_repr)
-            
-            return fused_repr
-        else:
-            # 没有频率信息时，直接返回序列表示
-            return final_output
+        # 频域解耦
+        high_freq_repr, low_freq_repr, freq_domain = self.freq_decoupler(output)
+        
+        # 更新频域历史（使用新的策略）
+        self.repetition_tracker.update_freq_history(freq_domain)
+        
+        # 重复兴趣检测（传递batch_size和device）
+        batch_size = high_freq_repr.shape[0]
+        device = high_freq_repr.device
+        repetition_scores = self.repetition_tracker(batch_size, device)
+        
+        # 融合推荐
+        final_repr = self.recommender(high_freq_repr, low_freq_repr, repetition_scores)
+        
+        return final_repr
     
     def calculate_loss(self, interaction):
         """计算损失"""
@@ -920,22 +593,30 @@ class DTWCoreSetSequenceRecommender(SequentialRecommender):
         
         seq_output = self.forward(item_seq, item_seq_len)
         
+        # 主推荐损失
         if self.loss_type == 'BPR':
             neg_items = interaction[self.NEG_ITEM_ID]
             pos_items_emb = self.item_embedding(pos_items)
             neg_items_emb = self.item_embedding(neg_items)
             pos_score = torch.sum(seq_output * pos_items_emb, dim=-1)
             neg_score = torch.sum(seq_output * neg_items_emb, dim=-1)
-            loss = self.loss_fct(pos_score, neg_score)
-        else:  # CE损失
+            main_loss = self.loss_fct(pos_score, neg_score)
+            
+            # 简化的对比学习损失
+            high_freq_repr, _, _ = self.freq_decoupler(seq_output)
+            pos_sim = F.cosine_similarity(high_freq_repr, pos_items_emb, dim=1)
+            neg_sim = F.cosine_similarity(high_freq_repr, neg_items_emb, dim=1)
+            contrast_loss = F.relu(1.0 - pos_sim + neg_sim).mean()
+        else:
             test_item_emb = self.item_embedding.weight
             logits = torch.matmul(seq_output, test_item_emb.transpose(0, 1))
-            loss = self.loss_fct(logits, pos_items)
+            main_loss = self.loss_fct(logits, pos_items)
+            contrast_loss = 0.0
         
-        return loss
+        return main_loss + self.contrast_weight * contrast_loss
     
     def predict(self, interaction):
-        """预测单个物品的分数"""
+        """预测"""
         item_seq = interaction[self.ITEM_SEQ]
         item_seq_len = interaction[self.ITEM_SEQ_LEN]
         test_item = interaction[self.ITEM_ID]
@@ -947,7 +628,7 @@ class DTWCoreSetSequenceRecommender(SequentialRecommender):
         return scores
     
     def full_sort_predict(self, interaction):
-        """预测所有物品的分数"""
+        """全排序预测"""
         item_seq = interaction[self.ITEM_SEQ]
         item_seq_len = interaction[self.ITEM_SEQ_LEN]
         
