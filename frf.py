@@ -1,17 +1,19 @@
 # -*- coding: utf-8 -*-
-# @Time    : 2025/5/27
+# @Time    : 2025/5/28
 # @Author  : OuyangNingtai
-# @Description: 简化版FRF模型 - 修复batch_size不匹配问题
+# @Description: 增强版FRF模型 - 应用方案1和方案3提升性能
 
 r"""
-FRF Simple - Simplified Frequency Repetitive Fusion Model
+FRF Boosted - Enhanced Frequency Repetitive Fusion Model
 ################################################
-简化版频域重复兴趣融合推荐模型
+基于现有简化版FRF，集成训练增强和伪集成技巧
 
-修复问题：
-- 解决不同batch_size导致的张量连接错误
-- 改用全局频域历史存储策略
-- 保持核心功能完整性
+新增功能：
+- Label Smoothing损失函数
+- 增强对比学习（温度缩放 + InfoNCE）
+- 频域正则化
+- 预测时伪集成策略
+- 后处理优化技巧
 """
 
 import numpy as np
@@ -28,15 +30,7 @@ from recbole.data.interaction import Interaction
 
 
 class FrequencyDomainDecoupler(nn.Module):
-    """简化版频域解耦器
-    
-    将用户兴趣分解为高频(重复兴趣)和低频(探索兴趣)两个表示
-    
-    Args:
-        embedding_dim (int): 嵌入维度
-        cutoff_ratio (float): 高低频分界点比例，固定值
-        high_freq_scale (float): 高频增强比例
-    """
+    """简化版频域解耦器 - 保持不变"""
     def __init__(self, embedding_dim, cutoff_ratio=0.6, high_freq_scale=1.5):
         super(FrequencyDomainDecoupler, self).__init__()
         self.embedding_dim = embedding_dim
@@ -63,14 +57,7 @@ class FrequencyDomainDecoupler(nn.Module):
         )
     
     def forward(self, seq_output):
-        """频域解耦处理
-        
-        Args:
-            seq_output (torch.Tensor): 序列表示, shape: [B, H]
-            
-        Returns:
-            tuple: 高频表示, 低频表示, 频域表示
-        """
+        """频域解耦处理"""
         # 安全性检查
         if torch.isnan(seq_output).any():
             seq_output = torch.nan_to_num(seq_output, nan=0.0, posinf=1.0, neginf=-1.0)
@@ -123,15 +110,7 @@ class FrequencyDomainDecoupler(nn.Module):
 
 
 class DTWRepetitionTracker(nn.Module):
-    """简化版DTW重复兴趣跟踪器
-    
-    使用DTW距离跟踪用户重复兴趣模式
-    
-    Args:
-        embedding_dim (int): 嵌入维度
-        window_size (int): 历史窗口大小
-        rep_threshold (float): 重复兴趣阈值
-    """
+    """DTW重复兴趣跟踪器 - 保持原有逻辑"""
     def __init__(self, embedding_dim, window_size=3, rep_threshold=0.6):
         super(DTWRepetitionTracker, self).__init__()
         self.embedding_dim = embedding_dim
@@ -150,13 +129,13 @@ class DTWRepetitionTracker(nn.Module):
         self._input_dim = None
         
         # 使用列表存储历史频域特征，避免batch_size不匹配问题
-        self.freq_history_list = deque(maxlen=window_size * 10)  # 最多存储window_size*10个样本
+        self.freq_history_list = deque(maxlen=window_size * 10)
     
     def _build_pattern_detector(self, input_dim, device):
         """动态构建模式检测器"""
         if self.pattern_detector is None:
             self._input_dim = input_dim
-            hidden_dim = max(input_dim // 4, 16)  # 确保隐藏层至少有16个神经元
+            hidden_dim = max(input_dim // 4, 16)
             
             self.pattern_detector = nn.Sequential(
                 nn.Linear(input_dim, hidden_dim),
@@ -177,29 +156,19 @@ class DTWRepetitionTracker(nn.Module):
                         nn.init.zeros_(module.bias)
     
     def update_freq_history(self, freq_features):
-        """更新频域历史
-        
-        Args:
-            freq_features (torch.Tensor): 频域特征 [B, F]
-        """
+        """更新频域历史 - 只保存幅度谱，避免复数警告"""
         if not self.training:
             return
             
         # 将当前批次的特征逐个添加到历史列表中
         with torch.no_grad():
             for i in range(freq_features.shape[0]):
-                self.freq_history_list.append(freq_features[i].cpu().clone())
+                # ✅ 只保存幅度，避免复数转换警告
+                magnitude = torch.abs(freq_features[i])
+                self.freq_history_list.append(magnitude.cpu().clone())
     
     def get_freq_history_tensor(self, batch_size, device):
-        """获取频域历史张量
-        
-        Args:
-            batch_size (int): 当前批次大小
-            device: 设备
-            
-        Returns:
-            torch.Tensor: 历史频域特征 [B, T, F] 或 None
-        """
+        """获取频域历史张量"""
         if len(self.freq_history_list) < 2:
             return None
         
@@ -217,14 +186,7 @@ class DTWRepetitionTracker(nn.Module):
         return history_tensor
     
     def dtw_distance(self, seq1: torch.Tensor, seq2: torch.Tensor) -> torch.Tensor:
-        """计算DTW距离（简化版）
-        
-        Args:
-            seq1, seq2: 输入序列
-            
-        Returns:
-            torch.Tensor: DTW距离
-        """
+        """计算DTW距离（简化版）"""
         # 检查缓存
         try:
             cache_key = (hash(seq1.cpu().detach().numpy().tobytes()), 
@@ -267,17 +229,9 @@ class DTWRepetitionTracker(nn.Module):
         return dist
     
     def compute_repetition_score(self, freq_history):
-        """计算重复强度分数
-        
-        Args:
-            freq_history (torch.Tensor): 频域历史 [B, T, F] 或 None
-            
-        Returns:
-            torch.Tensor: 重复强度分数 [B, 1]
-        """
+        """计算重复强度分数"""
         if freq_history is None:
-            # 没有历史，返回默认分数
-            batch_size = 1  # 默认值，会在调用时被正确设置
+            batch_size = 1
             device = self.dummy_param.device
             return torch.ones(batch_size, 1, device=device) * 0.5
         
@@ -285,12 +239,11 @@ class DTWRepetitionTracker(nn.Module):
         device = freq_history.device
         
         if freq_history.shape[1] < 2:
-            # 历史不足，返回默认分数
             return torch.ones(batch_size, 1, device=device) * 0.5
         
         # 提取高频部分
         cutoff = int(freq_history.shape[2] * 0.6)
-        high_freq_history = torch.abs(freq_history[:, :, :cutoff])
+        high_freq_history = freq_history[:, :, :cutoff]  # 现在已经是幅度谱
         
         # 归一化
         mean = high_freq_history.mean(dim=(1,2), keepdim=True)
@@ -307,12 +260,11 @@ class DTWRepetitionTracker(nn.Module):
         # 使用模式检测器
         repetition_scores = self.pattern_detector(latest_features)
         
-        # DTW相似性分析（如果有足够历史）
+        # DTW相似性分析
         if freq_history.shape[1] >= 2:
             dtw_similarities = []
             for i in range(batch_size):
                 try:
-                    # 比较最新和历史的相似性
                     recent_seq = high_freq_history[i, -1, :].unsqueeze(0)
                     past_seq = high_freq_history[i, :-1, :].mean(dim=0, keepdim=True)
                     
@@ -323,22 +275,12 @@ class DTWRepetitionTracker(nn.Module):
                     dtw_similarities.append(torch.tensor(0.5, device=device))
             
             dtw_sim = torch.stack(dtw_similarities).unsqueeze(1)
-            # 结合重复分数和DTW相似性
             repetition_scores = 0.7 * repetition_scores + 0.3 * dtw_sim
         
         return repetition_scores
     
     def forward(self, batch_size, device):
-        """前向传播
-        
-        Args:
-            batch_size (int): 当前批次大小
-            device: 设备
-            
-        Returns:
-            torch.Tensor: 重复强度分数 [B, 1]
-        """
-        # 获取历史频域特征
+        """前向传播"""
         freq_history = self.get_freq_history_tensor(batch_size, device)
         
         if freq_history is not None and torch.isnan(freq_history).any():
@@ -357,14 +299,7 @@ class DTWRepetitionTracker(nn.Module):
 
 
 class UnifiedRecommender(nn.Module):
-    """简化版统一推荐器
-    
-    使用固定策略融合高频和低频表示
-    
-    Args:
-        embedding_dim (int): 嵌入维度
-        rep_weight (float): 重复兴趣基准权重
-    """
+    """统一推荐器 - 保持原有逻辑"""
     def __init__(self, embedding_dim, rep_weight=0.7):
         super(UnifiedRecommender, self).__init__()
         self.embedding_dim = embedding_dim
@@ -386,16 +321,7 @@ class UnifiedRecommender(nn.Module):
         )
     
     def forward(self, high_freq_repr, low_freq_repr, repetition_scores):
-        """融合高频和低频表示
-        
-        Args:
-            high_freq_repr (torch.Tensor): 高频表示 [B, H]
-            low_freq_repr (torch.Tensor): 低频表示 [B, H]
-            repetition_scores (torch.Tensor): 重复强度分数 [B, 1]
-            
-        Returns:
-            torch.Tensor: 融合后的用户表示 [B, H]
-        """
+        """融合高频和低频表示"""
         # 动态权重计算
         fusion_input = torch.cat([high_freq_repr, low_freq_repr, repetition_scores], dim=1)
         dynamic_adjustment = self.fusion_network(fusion_input)
@@ -416,15 +342,8 @@ class UnifiedRecommender(nn.Module):
 
 
 class FRF(SequentialRecommender):
-    """简化版频域重复兴趣融合推荐模型
+    """增强版FRF模型 - 集成训练技巧和伪集成策略"""
     
-    保留核心功能：频域解耦 + DTW距离 + 重复检测
-    简化配置：移除复杂的可选功能，提升性能和可维护性
-    
-    Args:
-        config (Config): 配置对象
-        dataset (Dataset): 数据集
-    """
     def __init__(self, config, dataset):
         super(FRF, self).__init__(config, dataset)
         
@@ -439,13 +358,23 @@ class FRF(SequentialRecommender):
         self.hidden_act = config['hidden_act']
         self.layer_norm_eps = config['layer_norm_eps']
         
-        # 简化后的核心参数
-        self.cutoff_ratio = config['cutoff_ratio'] if 'cutoff_ratio' in config else 0.6
-        self.rep_weight = config['rep_weight'] if 'rep_weight' in config else 0.7
-        self.high_freq_scale = config['high_freq_scale'] if 'high_freq_scale' in config else 1.5
-        self.window_size = config['window_size'] if 'window_size' in config else 3
+        # 核心参数
+        self.cutoff_ratio = config['cutoff_ratio'] if 'cutoff_ratio' in config else 0.65  # ✅ 提升
+        self.rep_weight = config['rep_weight'] if 'rep_weight' in config else 0.75       # ✅ 提升
+        self.high_freq_scale = config['high_freq_scale'] if 'high_freq_scale' in config else 1.8  # ✅ 提升
+        self.window_size = config['window_size'] if 'window_size' in config else 7       # ✅ 提升
         self.rep_threshold = config['rep_threshold'] if 'rep_threshold' in config else 0.6
-        self.contrast_weight = config['contrast_weight'] if 'contrast_weight' in config else 0.3
+        self.contrast_weight = config['contrast_weight'] if 'contrast_weight' in config else 0.25  # ✅ 提升
+        
+        # ✅ 方案1：新增训练增强参数
+        self.label_smoothing = config['label_smoothing'] if 'label_smoothing' in config else 0.1
+        self.temperature = config['temperature'] if 'temperature' in config else 0.07
+        self.freq_reg_weight = config['freq_reg_weight'] if 'freq_reg_weight' in config else 0.01
+        
+        # ✅ 方案3：伪集成参数
+        self.ensemble_size = config['ensemble_size'] if 'ensemble_size' in config else 3
+        self.dropout_rates = [0.1, 0.15, 0.2]
+        self.prediction_temperature = config['prediction_temperature'] if 'prediction_temperature' in config else 1.02
         
         # 初始化嵌入层
         self.item_embedding = nn.Embedding(self.n_items, self.embedding_size, padding_idx=0)
@@ -465,7 +394,6 @@ class FRF(SequentialRecommender):
                 layer_norm_eps=self.layer_norm_eps
             )
         except ImportError:
-            # 降级方案
             self.encoder = nn.LSTM(
                 input_size=self.embedding_size,
                 hidden_size=self.hidden_size,
@@ -533,15 +461,7 @@ class FRF(SequentialRecommender):
         return extended_attention_mask
     
     def forward(self, item_seq, item_seq_len):
-        """前向传播
-        
-        Args:
-            item_seq (torch.LongTensor): 物品序列 [B, L]
-            item_seq_len (torch.LongTensor): 序列长度 [B]
-            
-        Returns:
-            torch.Tensor: 用户表示 [B, H]
-        """
+        """前向传播 - 保持原有逻辑"""
         # 序列编码
         position_ids = torch.arange(item_seq.size(1), dtype=torch.long, device=item_seq.device)
         position_ids = position_ids.unsqueeze(0).expand_as(item_seq)
@@ -572,10 +492,10 @@ class FRF(SequentialRecommender):
         # 频域解耦
         high_freq_repr, low_freq_repr, freq_domain = self.freq_decoupler(output)
         
-        # 更新频域历史（使用新的策略）
+        # 更新频域历史
         self.repetition_tracker.update_freq_history(freq_domain)
         
-        # 重复兴趣检测（传递batch_size和device）
+        # 重复兴趣检测
         batch_size = high_freq_repr.shape[0]
         device = high_freq_repr.device
         repetition_scores = self.repetition_tracker(batch_size, device)
@@ -586,37 +506,64 @@ class FRF(SequentialRecommender):
         return final_repr
     
     def calculate_loss(self, interaction):
-        """计算损失"""
+        """✅ 方案1：增强版损失函数"""
         item_seq = interaction[self.ITEM_SEQ]
         item_seq_len = interaction[self.ITEM_SEQ_LEN]
         pos_items = interaction[self.POS_ITEM_ID]
         
         seq_output = self.forward(item_seq, item_seq_len)
         
-        # 主推荐损失
         if self.loss_type == 'BPR':
             neg_items = interaction[self.NEG_ITEM_ID]
             pos_items_emb = self.item_embedding(pos_items)
             neg_items_emb = self.item_embedding(neg_items)
+            
             pos_score = torch.sum(seq_output * pos_items_emb, dim=-1)
             neg_score = torch.sum(seq_output * neg_items_emb, dim=-1)
-            main_loss = self.loss_fct(pos_score, neg_score)
             
-            # 简化的对比学习损失
-            high_freq_repr, _, _ = self.freq_decoupler(seq_output)
-            pos_sim = F.cosine_similarity(high_freq_repr, pos_items_emb, dim=1)
-            neg_sim = F.cosine_similarity(high_freq_repr, neg_items_emb, dim=1)
-            contrast_loss = F.relu(1.0 - pos_sim + neg_sim).mean()
-        else:
+            # ✅ Label Smoothing for BPR
+            margin = 1.0 - self.label_smoothing + self.label_smoothing * torch.rand_like(pos_score)
+            bpr_loss = -torch.log(torch.sigmoid(pos_score - neg_score + margin) + 1e-8).mean()
+            
+            # ✅ 增强对比学习（温度缩放 + InfoNCE风格）
+            high_freq_repr, _, freq_domain = self.freq_decoupler(seq_output)
+            
+            # 温度缩放的对比学习
+            pos_sim = F.cosine_similarity(high_freq_repr, pos_items_emb, dim=1) / self.temperature
+            neg_sim = F.cosine_similarity(high_freq_repr, neg_items_emb, dim=1) / self.temperature
+            
+            # InfoNCE风格的对比损失
+            contrast_loss = -torch.log(
+                torch.exp(pos_sim) / (torch.exp(pos_sim) + torch.exp(neg_sim) + 1e-8)
+            ).mean()
+            
+            # ✅ 频域正则化
+            freq_magnitude = torch.abs(freq_domain)
+            freq_reg = torch.mean(freq_magnitude) * self.freq_reg_weight
+            
+            return bpr_loss + self.contrast_weight * contrast_loss + freq_reg
+            
+        else:  # CE loss
             test_item_emb = self.item_embedding.weight
             logits = torch.matmul(seq_output, test_item_emb.transpose(0, 1))
-            main_loss = self.loss_fct(logits, pos_items)
-            contrast_loss = 0.0
-        
-        return main_loss + self.contrast_weight * contrast_loss
+            
+            # ✅ Label smoothing for CE
+            num_classes = logits.size(1)
+            smoothed_labels = torch.zeros_like(logits)
+            smoothed_labels.scatter_(1, pos_items.unsqueeze(1), 1.0 - self.label_smoothing)
+            smoothed_labels += self.label_smoothing / num_classes
+            
+            ce_loss = F.kl_div(F.log_softmax(logits, dim=1), smoothed_labels, reduction='batchmean')
+            
+            # 频域正则化
+            _, _, freq_domain = self.freq_decoupler(seq_output)
+            freq_magnitude = torch.abs(freq_domain)
+            freq_reg = torch.mean(freq_magnitude) * self.freq_reg_weight
+            
+            return ce_loss + freq_reg
     
     def predict(self, interaction):
-        """预测"""
+        """预测 - 保持原有逻辑"""
         item_seq = interaction[self.ITEM_SEQ]
         item_seq_len = interaction[self.ITEM_SEQ_LEN]
         test_item = interaction[self.ITEM_ID]
@@ -628,12 +575,40 @@ class FRF(SequentialRecommender):
         return scores
     
     def full_sort_predict(self, interaction):
-        """全排序预测"""
+        """✅ 方案3：伪集成 + 后处理优化的全排序预测"""
         item_seq = interaction[self.ITEM_SEQ]
         item_seq_len = interaction[self.ITEM_SEQ_LEN]
         
-        seq_output = self.forward(item_seq, item_seq_len)
-        test_items_emb = self.item_embedding.weight
-        scores = torch.matmul(seq_output, test_items_emb.transpose(0, 1))
+        # ✅ 伪集成策略：多次预测求平均
+        all_scores = []
+        original_dropout_p = self.dropout.p
         
-        return scores
+        for i in range(self.ensemble_size):
+            # 设置不同的dropout率
+            self.dropout.p = self.dropout_rates[i]
+            
+            with torch.no_grad():
+                seq_output = self.forward(item_seq, item_seq_len)
+                test_items_emb = self.item_embedding.weight
+                scores = torch.matmul(seq_output, test_items_emb.transpose(0, 1))
+                all_scores.append(scores)
+        
+        # 恢复原始dropout率
+        self.dropout.p = original_dropout_p
+        
+        # 平均预测结果
+        ensemble_scores = torch.stack(all_scores).mean(dim=0)
+        
+        # ✅ 后处理技巧
+        batch_size = item_seq.shape[0]
+        
+        # 1. 历史物品轻微惩罚（避免重复推荐）
+        for i in range(batch_size):
+            historical_items = item_seq[i][item_seq[i] > 0]
+            if len(historical_items) > 0:
+                ensemble_scores[i, historical_items] *= 0.98
+        
+        # 2. 温度缩放（让预测更confident）
+        final_scores = ensemble_scores / self.prediction_temperature
+        
+        return final_scores
