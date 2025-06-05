@@ -1,19 +1,13 @@
 # -*- coding: utf-8 -*-
 # @Time    : 2025/5/28
 # @Author  : OuyangNingtai
-# @Description: 增强版FRF模型 - 应用方案1和方案3提升性能
+# @Description: FRF模型 
 
 r"""
 FRF Boosted - Enhanced Frequency Repetitive Fusion Model
 ################################################
-基于现有简化版FRF，集成训练增强和伪集成技巧
 
-新增功能：
-- Label Smoothing损失函数
-- 增强对比学习（温度缩放 + InfoNCE）
-- 频域正则化
-- 预测时伪集成策略
-- 后处理优化技巧
+
 """
 
 import numpy as np
@@ -30,7 +24,7 @@ from recbole.data.interaction import Interaction
 
 
 class FrequencyDomainDecoupler(nn.Module):
-    """简化版频域解耦器 - 保持不变"""
+    """简化版频域解耦器 """
     def __init__(self, embedding_dim, cutoff_ratio=0.6, high_freq_scale=1.5):
         super(FrequencyDomainDecoupler, self).__init__()
         self.embedding_dim = embedding_dim
@@ -163,7 +157,7 @@ class DTWRepetitionTracker(nn.Module):
         # 将当前批次的特征逐个添加到历史列表中
         with torch.no_grad():
             for i in range(freq_features.shape[0]):
-                # ✅ 只保存幅度，避免复数转换警告
+                
                 magnitude = torch.abs(freq_features[i])
                 self.freq_history_list.append(magnitude.cpu().clone())
     
@@ -299,7 +293,7 @@ class DTWRepetitionTracker(nn.Module):
 
 
 class UnifiedRecommender(nn.Module):
-    """统一推荐器 - 保持原有逻辑"""
+    """统一推荐器 """
     def __init__(self, embedding_dim, rep_weight=0.7):
         super(UnifiedRecommender, self).__init__()
         self.embedding_dim = embedding_dim
@@ -342,7 +336,7 @@ class UnifiedRecommender(nn.Module):
 
 
 class FRF(SequentialRecommender):
-    """增强版FRF模型 - 集成训练技巧和伪集成策略"""
+    ""FRF模型"""
     
     def __init__(self, config, dataset):
         super(FRF, self).__init__(config, dataset)
@@ -359,19 +353,17 @@ class FRF(SequentialRecommender):
         self.layer_norm_eps = config['layer_norm_eps']
         
         # 核心参数
-        self.cutoff_ratio = config['cutoff_ratio'] if 'cutoff_ratio' in config else 0.65  # ✅ 提升
-        self.rep_weight = config['rep_weight'] if 'rep_weight' in config else 0.75       # ✅ 提升
-        self.high_freq_scale = config['high_freq_scale'] if 'high_freq_scale' in config else 1.8  # ✅ 提升
-        self.window_size = config['window_size'] if 'window_size' in config else 7       # ✅ 提升
+        self.cutoff_ratio = config['cutoff_ratio'] if 'cutoff_ratio' in config else 0.65 
+        self.rep_weight = config['rep_weight'] if 'rep_weight' in config else 0.75       
+        self.high_freq_scale = config['high_freq_scale'] if 'high_freq_scale' in config else 1.8 
+        self.window_size = config['window_size'] if 'window_size' in config else 7     
         self.rep_threshold = config['rep_threshold'] if 'rep_threshold' in config else 0.6
-        self.contrast_weight = config['contrast_weight'] if 'contrast_weight' in config else 0.25  # ✅ 提升
+        self.contrast_weight = config['contrast_weight'] if 'contrast_weight' in config else 0.25  
         
-        # ✅ 方案1：新增训练增强参数
+        # 训练增强参数
         self.label_smoothing = config['label_smoothing'] if 'label_smoothing' in config else 0.1
         self.temperature = config['temperature'] if 'temperature' in config else 0.07
         self.freq_reg_weight = config['freq_reg_weight'] if 'freq_reg_weight' in config else 0.01
-        
-        # ✅ 方案3：伪集成参数
         self.ensemble_size = config['ensemble_size'] if 'ensemble_size' in config else 3
         self.dropout_rates = [0.1, 0.15, 0.2]
         self.prediction_temperature = config['prediction_temperature'] if 'prediction_temperature' in config else 1.02
@@ -506,7 +498,7 @@ class FRF(SequentialRecommender):
         return final_repr
     
     def calculate_loss(self, interaction):
-        """✅ 方案1：增强版损失函数"""
+        """增强损失函数"""
         item_seq = interaction[self.ITEM_SEQ]
         item_seq_len = interaction[self.ITEM_SEQ_LEN]
         pos_items = interaction[self.POS_ITEM_ID]
@@ -521,11 +513,11 @@ class FRF(SequentialRecommender):
             pos_score = torch.sum(seq_output * pos_items_emb, dim=-1)
             neg_score = torch.sum(seq_output * neg_items_emb, dim=-1)
             
-            # ✅ Label Smoothing for BPR
+            # Label Smoothing for BPR
             margin = 1.0 - self.label_smoothing + self.label_smoothing * torch.rand_like(pos_score)
             bpr_loss = -torch.log(torch.sigmoid(pos_score - neg_score + margin) + 1e-8).mean()
             
-            # ✅ 增强对比学习（温度缩放 + InfoNCE风格）
+            # 增强对比学习（温度缩放 + InfoNCE风格）
             high_freq_repr, _, freq_domain = self.freq_decoupler(seq_output)
             
             # 温度缩放的对比学习
@@ -537,7 +529,7 @@ class FRF(SequentialRecommender):
                 torch.exp(pos_sim) / (torch.exp(pos_sim) + torch.exp(neg_sim) + 1e-8)
             ).mean()
             
-            # ✅ 频域正则化
+            #频域正则化
             freq_magnitude = torch.abs(freq_domain)
             freq_reg = torch.mean(freq_magnitude) * self.freq_reg_weight
             
@@ -547,7 +539,7 @@ class FRF(SequentialRecommender):
             test_item_emb = self.item_embedding.weight
             logits = torch.matmul(seq_output, test_item_emb.transpose(0, 1))
             
-            # ✅ Label smoothing for CE
+            # Label smoothing for CE
             num_classes = logits.size(1)
             smoothed_labels = torch.zeros_like(logits)
             smoothed_labels.scatter_(1, pos_items.unsqueeze(1), 1.0 - self.label_smoothing)
@@ -575,11 +567,10 @@ class FRF(SequentialRecommender):
         return scores
     
     def full_sort_predict(self, interaction):
-        """✅ 方案3：伪集成 + 后处理优化的全排序预测"""
+        
         item_seq = interaction[self.ITEM_SEQ]
         item_seq_len = interaction[self.ITEM_SEQ_LEN]
         
-        # ✅ 伪集成策略：多次预测求平均
         all_scores = []
         original_dropout_p = self.dropout.p
         
@@ -599,10 +590,9 @@ class FRF(SequentialRecommender):
         # 平均预测结果
         ensemble_scores = torch.stack(all_scores).mean(dim=0)
         
-        # ✅ 后处理技巧
         batch_size = item_seq.shape[0]
         
-        # 1. 历史物品轻微惩罚（避免重复推荐）
+        # 1. 历史物品轻微惩罚（避免过度重复推荐）
         for i in range(batch_size):
             historical_items = item_seq[i][item_seq[i] > 0]
             if len(historical_items) > 0:
