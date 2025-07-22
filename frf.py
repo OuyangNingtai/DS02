@@ -336,7 +336,7 @@ class UnifiedRecommender(nn.Module):
 
 
 class FRF(SequentialRecommender):
-    ""FRF模型"""
+    """FRF模型"""
     
     def __init__(self, config, dataset):
         super(FRF, self).__init__(config, dataset)
