@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 # @Time    : 2025/5/28
 # @Author  : OuyangNingtai
-# @Description: FRF模型 
+
 
 r"""
 FRF Boosted - Enhanced Frequency Repetitive Fusion Model
